@@ -33,9 +33,13 @@ const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
 // Desktop 版 watchlist 面板按鈕（中文 aria-label）
 const WL_BTN = '[data-name="watchlists-button"]';
 const ADD_BTN = '[data-name="add-symbol-button"]';
-// 切換後等待資料載入的固定時間（ms）
-const SYMBOL_WAIT = 700;
-const TF_WAIT = 450;
+// 切換後的沉澱時間（ms）。資料是否就緒改由 waitForChart 輪詢判定，
+// 這裡只要讓 setSymbol/setResolution 有機會生效即可。
+const SYMBOL_WAIT = 150;
+const TF_WAIT = 100;
+// 等待圖表載入資料的輪詢間隔與逾時（ms）
+const POLL_INTERVAL = 200;
+const LOAD_TIMEOUT = 8000;
 
 const TIMEFRAMES = [
   { tf: '18D', label: '18D', signal: 'bull' },
@@ -216,6 +220,32 @@ async function chartSetTimeframe(tf) {
   `);
 }
 
+// 固定 sleep 會在資料還沒載入時就去讀：輕則誤判「無資料」，重則讀到
+// 上一個幣對殘留的 K 棒而給出錯誤訊號。改為輪詢，直到圖表確實切到目標
+// 幣對與週期、且拿得到足夠的 K 棒為止。
+async function waitForChart(symbol, tf, minBars = 2, timeoutMs = LOAD_TIMEOUT) {
+  const wantTf = tf === 'D' ? '1D' : tf;   // setResolution('D') 回報為 '1D'
+  const deadline = Date.now() + timeoutMs;
+  let seen = 0;
+  while (Date.now() < deadline) {
+    const state = await evaluate(`(function() {
+      var c = ${CHART_API};
+      return { symbol: c.symbol(), resolution: c.resolution() };
+    })()`);
+    if (state && state.symbol === symbol && state.resolution === wantTf) {
+      try {
+        const result = await getOhlcv({ count: 3 });
+        seen = result?.bars?.length || 0;
+        if (seen >= minBars) return result.bars;
+      } catch {
+        // 資料尚未就緒，繼續等
+      }
+    }
+    await sleep(POLL_INTERVAL);
+  }
+  throw new Error(`載入逾時（只拿到 ${seen} 根 K 棒）`);
+}
+
 async function scanSymbol(tvSymbol) {
   try {
     await chartSetSymbol(tvSymbol);
@@ -225,8 +255,7 @@ async function scanSymbol(tvSymbol) {
 
       let bars;
       try {
-        const result = await getOhlcv({ count: 3 });
-        bars = result.bars;
+        bars = await waitForChart(tvSymbol, tf);
       } catch {
         return { pass: false, failedAt: label, reason: 'no_data' };
       }
