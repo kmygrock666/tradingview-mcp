@@ -7,10 +7,14 @@
  */
 import { evaluate, evaluateAsync, getClient } from '../connection.js';
 
-// TV renamed the right-rail button: current builds use data-name="base" with
+// TV renamed the right-rail button across builds: 3.4.x uses
+// data-name="watchlists-button"; some builds use data-name="base" with
 // aria-label "Watchlist, details, and news"; older builds used
 // data-name="base-watchlist-widget-button" / aria-label "Watchlist".
-const WL_BUTTON_JS = `(document.querySelector('[data-name="base-watchlist-widget-button"]')
+// The aria-label variants only match an English UI, so the locale-independent
+// data-name selectors come first.
+const WL_BUTTON_JS = `(document.querySelector('[data-name="watchlists-button"]')
+  || document.querySelector('[data-name="base-watchlist-widget-button"]')
   || document.querySelector('[aria-label="Watchlist, details, and news"]')
   || document.querySelector('[aria-label^="Watchlist"]'))`;
 
@@ -24,8 +28,12 @@ async function ensureWatchlistOpen(maxWaitMs = 5000) {
       var pressed = btn.getAttribute('aria-pressed') === 'true';
       var widgetReady = !!(document.querySelector('[data-name="add-symbol-button"]')
         || document.querySelector('[class*="layout__area--right"] [data-symbol-full]'));
-      if (!pressed || !widgetReady) { if (!pressed) btn.click(); return { opened: !pressed }; }
-      return { opened: false, ready: true };
+      // Some builds omit aria-pressed on the button, so an already-open panel
+      // reads as "not pressed" — clicking would close it and the readiness poll
+      // below would then time out. The widget's own content is the reliable signal.
+      if (widgetReady) return { opened: false, ready: true };
+      if (!pressed) btn.click();
+      return { opened: !pressed };
     })()
   `);
   if (state?.error) throw new Error(state.error);
@@ -194,8 +202,11 @@ export async function remove({ symbols }) {
   }
 
   // Page-context fetch — browser attaches session cookies automatically.
+  // Use location.origin, not a hardcoded www.tradingview.com: localized builds
+  // run on tw./de./… hosts, and the cross-origin call is blocked outright
+  // (HTTP 0 / "Failed to fetch").
   const resp = await evaluateAsync(`
-    fetch('https://www.tradingview.com/api/v1/symbols_list/custom/' + ${JSON.stringify(listInfo.id)} + '/remove/', {
+    fetch(location.origin + '/api/v1/symbols_list/custom/' + ${JSON.stringify(listInfo.id)} + '/remove/', {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
@@ -210,29 +221,34 @@ export async function remove({ symbols }) {
   }
 
   // The desktop widget doesn't live-sync API removals — remount it by
-  // toggling the panel, then verify the rows are actually gone.
+  // toggling the panel so the UI catches up. Best-effort only: the widget can
+  // keep serving stale rows indefinitely, so verification reads the list back
+  // from the API instead. Checking the DOM reported successful removals as
+  // failures, and callers that retry on !verified then looped forever.
   await evaluate(`(function() { var btn = ${WL_BUTTON_JS}; if (btn) btn.click(); })()`);
   await new Promise(r => setTimeout(r, 400));
   await evaluate(`(function() { var btn = ${WL_BUTTON_JS}; if (btn) btn.click(); })()`);
 
-  let stillPresent = toRemove;
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 500));
-    stillPresent = await evaluate(`
-      (function() {
-        var rows = document.querySelectorAll('[class*="layout__area--right"] [data-symbol-full]');
-        var present = {};
-        for (var i = 0; i < rows.length; i++) present[rows[i].getAttribute('data-symbol-full')] = true;
-        return ${JSON.stringify(toRemove)}.filter(function(s) { return present[s]; });
-      })()
-    `) || [];
-    if (stillPresent.length === 0) break;
-  }
+  const check = await evaluateAsync(`
+    fetch(location.origin + '/api/v1/symbols_list/custom/' + ${JSON.stringify(listInfo.id)} + '/', {
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(j) { return { symbols: j.symbols || [] }; })
+      .catch(function() { return null; })
+  `);
+  // A failed read-back leaves the outcome unknown — report it as unverified
+  // rather than assuming the removal stuck.
+  const stillPresent = check
+    ? toRemove.filter(s => check.symbols.includes(s))
+    : toRemove;
 
   return {
     success: true, removed: toRemove, skipped,
     verified: stillPresent.length === 0,
+    still_present: stillPresent,
+    verify_source: check ? 'rest' : 'unavailable',
     list_id: listInfo.id, list_name: listInfo.name, api: 'rest',
   };
 }

@@ -39,6 +39,9 @@ const TF_WAIT = 450;
 
 // 已通知記錄：避免同一根 K 棒重複通知（key = symbol+barTime）
 const notified = new Set();
+// 已通知移除的幣對（key = tvSym）。移除驗證失敗時避免每輪重發；
+// 幣對確實離開清單後會清掉記錄，日後重新加回才會再通知。
+const removeNotified = new Set();
 
 // ─── 吞噬判斷 ────────────────────────────────────
 function isBullEngulf(c, p) {
@@ -95,9 +98,30 @@ async function switchTF(tf) {
   })`);
 }
 
+// ─── 讀取雲端自訂清單（權威來源）────────────────────
+// 桌面版 widget 不會即時同步 API 的異動：移除成功後畫面仍留著舊的 row。
+// 改以 REST 為準，否則下一輪會掃到已移除的殭屍標的並重複通知。
+async function fetchCustomLists() {
+  const lists = await evaluateAsync(`
+    fetch(location.origin + '/api/v1/symbols_list/custom/', {
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        return Array.isArray(j)
+          ? j.map(function(x) { return { id: x.id, name: x.name, symbols: x.symbols || [] }; })
+          : [];
+      })
+      .catch(function() { return []; })
+  `);
+  return lists || [];
+}
+
 // ─── 從 TradingView 讀取多個清單頁籤的幣對 ──────────
-// 依序切換至每個頁籤讀取，讀完後切回原清單
-async function fetchWatchlists(listNames) {
+// 依序切換至每個頁籤讀取，讀完後切回原清單。
+// 僅用於不在自訂清單 API 中的內建清單（例如「加密貨幣」）。
+async function fetchWatchlistsFromDom(listNames) {
   const result = await evaluateAsync(`(async function() {
     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -160,8 +184,23 @@ async function fetchWatchlists(listNames) {
   for (const name of result?.missing || []) {
     console.warn(`  ⚠️  找不到「${name}」清單頁籤，已跳過`);
   }
-  if (!result?.lists?.length) throw new Error('所有監控清單皆不存在或無法讀取');
-  return result.lists;
+  return result?.lists || [];
+}
+
+// ─── 取得監控清單：自訂清單走 API，其餘退回讀 DOM ────
+async function fetchWatchlists(listNames) {
+  const custom = await fetchCustomLists();
+  const lists = [];
+  const domNames = [];
+  for (const name of listNames) {
+    const found = custom.find(l => l.name === name);
+    if (found) lists.push({ list: name, symbols: found.symbols });
+    else domNames.push(name);
+  }
+  if (domNames.length) lists.push(...await fetchWatchlistsFromDom(domNames));
+  lists.sort((a, b) => listNames.indexOf(a.list) - listNames.indexOf(b.list));
+  if (!lists.length) throw new Error('所有監控清單皆不存在或無法讀取');
+  return lists;
 }
 
 // ─── 檢查極速匡移除條件：3D 當前或前一根黑吞 ──────────
@@ -276,6 +315,10 @@ async function runScan() {
     return;
   }
 
+  // 已離開極速匡的幣對：清掉移除通知記錄，日後重新加回才會再通知
+  const jskSymbols = new Set(lists.find(l => l.list === '極速匡')?.symbols || []);
+  for (const s of removeNotified) if (!jskSymbols.has(s)) removeNotified.delete(s);
+
   const signals = [];
   const removals = [];
   const scanned = new Set(); // 同一輪跨清單去重：同幣對只掃一次
@@ -318,12 +361,20 @@ async function runScan() {
     console.log(`\n  🗑 自極速匡移除：${removals.map(r => r.displayName).join(', ')}`);
     try {
       const res = await removeFromList('極速匡', removals.map(r => r.tvSym));
-      if (!res.verified) console.warn('  ⚠️  移除後仍偵測到部分幣對，下次掃描將重試');
-      await notify(
-        '極速匡移除訊號',
-        removals.map(r => `${r.displayName}（${r.reason}）`).join('\n'),
-        '🗑'
-      );
+      // 只有真的移除成功才通知，否則每輪都會重掃到同一批幣對而重複發送。
+      if (!res.verified) {
+        console.warn('  ⚠️  移除未通過驗證，下次掃描將重試（不發通知）');
+      } else {
+        const fresh = removals.filter(r => !removeNotified.has(r.tvSym));
+        if (fresh.length) {
+          for (const r of fresh) removeNotified.add(r.tvSym);
+          await notify(
+            '極速匡移除訊號',
+            fresh.map(r => `${r.displayName}（${r.reason}）`).join('\n'),
+            '🗑'
+          );
+        }
+      }
     } catch (e) {
       console.error('  ⚠️  移除失敗（下次掃描將重試）:', e.message);
     }
