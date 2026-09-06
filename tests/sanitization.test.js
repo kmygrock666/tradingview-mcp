@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { safeString, requireFinite } from '../src/connection.js';
 import { setSymbol, setTimeframe, setType, manageIndicator, setVisibleRange } from '../src/core/chart.js';
 import { drawShape } from '../src/core/drawing.js';
@@ -287,7 +288,10 @@ describe('drawing.js — sanitized evaluate calls', () => {
 // ── Source-level audit ───────────────────────────────────────────────────
 
 describe('source audit — no unsafe interpolation patterns', () => {
-  const CORE_DIR = new URL('../src/core/', import.meta.url).pathname;
+  // pathname keeps the leading slash on Windows ("/C:/…"), which readdirSync
+  // then resolves against the cwd drive as "C:\C:\…". fileURLToPath is the
+  // platform-correct conversion.
+  const CORE_DIR = fileURLToPath(new URL('../src/core/', import.meta.url));
   const coreFiles = readdirSync(CORE_DIR).filter(f => f.endsWith('.js'));
 
   for (const file of coreFiles) {
