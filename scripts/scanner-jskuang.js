@@ -8,11 +8,25 @@
  * 紅吞：當前紅K實體棒最高點(close) > 前一根K棒實體棒最高點(max(o,c))
  * 黑吞：當前黑K實體棒最低點(close) < 前一根K棒實體棒最低點(min(o,c))
  *
- * 用法：node scripts/scanner-jskuang.js
+ * 只收 BINGX 永續合約：加入清單時帶完整代號，避免 TradingView 搜尋
+ * 自行挑成別家交易所。清單中已有同名幣對（不分交易所）則略過。
+ * 確定加入的標的會發 Telegram 通知。
+ *
+ * 用法：node --env-file=.env scripts/scanner-jskuang.js
  */
 
 import { connect, disconnect, evaluate, evaluateAsync, getClient } from '../src/connection.js';
 import { getOhlcv } from '../src/core/data.js';
+
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+if (!TG_TOKEN || !TG_CHAT_ID) {
+  console.error('請設定環境變數 TELEGRAM_BOT_TOKEN 與 TELEGRAM_CHAT_ID');
+  process.exit(1);
+}
+
+// 掃描結果要寫入的清單
+const LIST_NAME = '極速匡';
 
 const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
 
@@ -82,6 +96,49 @@ async function ensureWatchlistOpen() {
   throw new Error('Watchlist 面板未就緒');
 }
 
+// ─── Telegram 通知 ────────────────────────────────
+async function notify(title, message, emoji = '🆕') {
+  try {
+    const text = `${emoji} <b>${title}</b>\n${message}`;
+    const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'HTML' }),
+    });
+    const json = await res.json();
+    if (!json.ok) console.error('TG 發送失敗:', json.description);
+  } catch (e) {
+    console.error('TG 通知錯誤:', e.message);
+  }
+}
+
+// ─── 讀取清單現有幣對 ─────────────────────────────
+// 以 REST 為準：桌面版 widget 不會同步 API 的異動，畫面上的 row 可能過期。
+async function fetchListSymbols(listName) {
+  return evaluateAsync(`
+    fetch(location.origin + '/api/v1/symbols_list/custom/', {
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        if (!Array.isArray(j)) return null;
+        for (var i = 0; i < j.length; i++) {
+          if (j[i].name === ${JSON.stringify(listName)}) {
+            return { id: j[i].id, symbols: j[i].symbols || [] };
+          }
+        }
+        return null;
+      })
+      .catch(function() { return null; })
+  `);
+}
+
+// 不分交易所比對：OKX:JUPUSDT.P 與 BINGX:JUPUSDT.P 視為同一個幣對
+function bareTicker(symbol) {
+  return symbol.split(':').pop().replace('.P', '').toUpperCase();
+}
+
 async function addSymbolToWatchlist(symbol) {
   const c = await getClient();
   await ensureWatchlistOpen();
@@ -96,9 +153,9 @@ async function addSymbolToWatchlist(symbol) {
   if (!clicked) throw new Error('無法點擊新增按鈕');
   await sleep(400);
 
-  // 輸入幣對名稱（只輸入 ticker 不含 exchange 前綴）
-  const ticker = symbol.split(':').pop();   // BTCUSDT.P
-  await c.Input.insertText({ text: ticker });
+  // 輸入完整代號（含 exchange 前綴）。只給裸 ticker 的話搜尋會自行挑
+  // 交易所，同一個幣可能被加成 OKX / BINANCE 版本而非 BINGX。
+  await c.Input.insertText({ text: symbol });   // BINGX:BTCUSDT.P
   await sleep(700);
   await c.Input.dispatchKeyEvent({ type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
   await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter' });
@@ -244,11 +301,45 @@ async function main() {
   console.log(`\n📌 符合幣對（${matched.length}/${total}）：`);
 
   if (matched.length > 0) {
-    matched.forEach(s => console.log(`   • ${s.replace('BINGX:', '').replace('.P', '')}`));
+    matched.forEach(s => console.log(`   • ${bareTicker(s)}`));
 
-    console.log('\n📥 正在加入 TradingView 清單...');
-    const wlResult = await addBulkToWatchlist(matched);
-    console.log(`✅ 成功加入 ${wlResult.added} 個，失敗 ${wlResult.failed} 個`);
+    const list = await fetchListSymbols(LIST_NAME);
+    if (!list) {
+      console.log(`\n⚠️  讀不到「${LIST_NAME}」清單，略過加入步驟`);
+    } else {
+      const existing = new Set(list.symbols.map(bareTicker));
+      const toAdd = matched.filter(s => !existing.has(bareTicker(s)));
+      const dup = matched.filter(s => existing.has(bareTicker(s)));
+
+      if (dup.length) {
+        console.log(`\n⏭  清單已有，略過 ${dup.length} 個：${dup.map(bareTicker).join(', ')}`);
+      }
+
+      if (!toAdd.length) {
+        console.log(`\n   （符合的幣對清單中都已存在，無新增）`);
+      } else {
+        console.log(`\n📥 正在加入「${LIST_NAME}」...`);
+        const wlResult = await addBulkToWatchlist(toAdd);
+        console.log(`✅ 送出 ${wlResult.added} 個，失敗 ${wlResult.failed} 個`);
+
+        // 以 REST 回讀確認：widget 的畫面不足以判斷是否真的寫進清單，
+        // 只有確定加入的才通知，避免發出不存在的標的。
+        const after = await fetchListSymbols(LIST_NAME);
+        const confirmed = after ? toAdd.filter(s => after.symbols.includes(s)) : [];
+        const unconfirmed = toAdd.filter(s => !confirmed.includes(s));
+
+        if (confirmed.length) {
+          await notify(
+            `${LIST_NAME}新增標的`,
+            confirmed.map(s => `${bareTicker(s)}（18D+3D+1D 紅吞 + 3H 吞噬）`).join('\n')
+          );
+          console.log(`🔔 已通知 TG：${confirmed.map(bareTicker).join(', ')}`);
+        }
+        if (unconfirmed.length) {
+          console.log(`⚠️  未確認加入，不發通知：${unconfirmed.map(bareTicker).join(', ')}`);
+        }
+      }
+    }
   } else {
     console.log('   （目前無符合幣對）');
   }
