@@ -1,0 +1,65 @@
+//@version=5
+indicator("極速匡進場監控", overlay=true, max_bars_back=500)
+
+// ═══════════════════════════════════════════════════
+// 極速匡進場監控
+//
+// 進場條件（三者同時成立）：
+//   1. 過去5根3H K棒中曾出現「黑吞」或「收黑K」（觸發）
+//   2. 當前3H K棒出現「紅吞」（確認）
+//   3. 最近3根1H K棒收盤連續墊高，即底底高（結構）
+//
+// 定義：
+//   紅吞 = 紅K 且 收盤 > max(前棒開盤, 前棒收盤)
+//   黑吞 = 黑K 且 收盤 < min(前棒開盤, 前棒收盤)
+//   底底高 = close[-2] < close[-1] < close[0]（1H）
+// ═══════════════════════════════════════════════════
+
+// ─── 輔助函式 ─────────────────────────────────────
+bullEngulf(c, o, pc, po) =>
+    c > o and c > math.max(pc, po)
+
+bearEngulf(c, o, pc, po) =>
+    c < o and c < math.min(pc, po)
+
+// ─── 3H 資料 ──────────────────────────────────────
+h3c = request.security(syminfo.tickerid, "180", close, lookahead=barmerge.lookahead_off)
+h3o = request.security(syminfo.tickerid, "180", open,  lookahead=barmerge.lookahead_off)
+
+// 條件2：當前3H K棒是紅吞
+h3_bull_now = bullEngulf(h3c, h3o, h3c[1], h3o[1])
+
+// 條件1：前5根3H K棒中曾出現「黑吞」或「收黑K」
+h3_bear1 = bearEngulf(h3c[1], h3o[1], h3c[2], h3o[2]) or (h3c[1] < h3o[1])
+h3_bear2 = bearEngulf(h3c[2], h3o[2], h3c[3], h3o[3]) or (h3c[2] < h3o[2])
+h3_bear3 = bearEngulf(h3c[3], h3o[3], h3c[4], h3o[4]) or (h3c[3] < h3o[3])
+h3_bear4 = bearEngulf(h3c[4], h3o[4], h3c[5], h3o[5]) or (h3c[4] < h3o[4])
+h3_bear5 = bearEngulf(h3c[5], h3o[5], h3c[6], h3o[6]) or (h3c[5] < h3o[5])
+h3_had_bear = h3_bear1 or h3_bear2 or h3_bear3 or h3_bear4 or h3_bear5
+
+// ─── 1H 資料 ──────────────────────────────────────
+h1c = request.security(syminfo.tickerid, "60", close, lookahead=barmerge.lookahead_off)
+
+// 條件3：最近3根1H收盤連續墊高（底底高）
+h1_higher_lows = h1c[2] < h1c[1] and h1c[1] < h1c
+
+// ─── 進場信號 ─────────────────────────────────────
+entry_signal = h3_bull_now and h3_had_bear and h1_higher_lows
+
+// ─── 視覺輸出 ─────────────────────────────────────
+plotshape(entry_signal,
+          title     = "進場信號",
+          style     = shape.labelup,
+          location  = location.belowbar,
+          color     = color.new(color.green, 0),
+          textcolor = color.white,
+          text      = "進場",
+          size      = size.normal)
+
+bgcolor(entry_signal ? color.new(color.green, 85) : na,
+        title = "進場背景高亮")
+
+// ─── 警報條件 ─────────────────────────────────────
+alertcondition(entry_signal,
+               title   = "極速匡進場",
+               message = "極速匡進場信號 - {{ticker}} @{{close}}")
