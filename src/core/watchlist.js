@@ -123,6 +123,85 @@ export async function get() {
   };
 }
 
+// Cloud custom lists via REST — authoritative regardless of which tab the
+// widget shows (the widget doesn't live-sync API writes, see remove()).
+async function fetchCustomLists() {
+  const lists = await evaluateAsync(`
+    fetch(location.origin + '/api/v1/symbols_list/custom/', {
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        return Array.isArray(j)
+          ? j.map(function(x) { return { id: x.id, name: x.name, symbols: x.symbols || [] }; })
+          : null;
+      })
+      .catch(function() { return null; })
+  `);
+  if (!lists) throw new Error('Failed to read custom watchlists via REST');
+  return lists;
+}
+
+export async function findList({ name }) {
+  const lists = await fetchCustomLists();
+  return lists.find(l => l.name === name) || null;
+}
+
+// Append symbols to a named cloud list without touching the active tab.
+// Symbols must be full EXCHANGE:SYMBOL format — the REST API stores them
+// verbatim with no search resolution (unlike add(), which drives the UI).
+export async function addToList({ list, symbols }) {
+  const target = await findList({ name: list });
+  if (!target) throw new Error(`Custom watchlist "${list}" not found — create it in TradingView first`);
+
+  const existing = new Set(target.symbols);
+  const fresh = symbols.filter(s => !existing.has(s));
+  const skipped = symbols.filter(s => existing.has(s));
+  if (!fresh.length) {
+    return {
+      success: true, added: [], skipped, verified: true, missing: [],
+      list_id: target.id, list_name: target.name, api: 'rest',
+    };
+  }
+
+  // The append response body is the list's updated symbol array — parse it
+  // in page context and use it as verification instead of a second read-back.
+  const resp = await evaluateAsync(`
+    fetch(location.origin + '/api/v1/symbols_list/custom/' + ${JSON.stringify(target.id)} + '/append/', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify(${JSON.stringify(fresh)}),
+    })
+      .then(function(r) {
+        return r.text().then(function(t) {
+          var symbols = null;
+          try { var j = JSON.parse(t); if (Array.isArray(j)) symbols = j; } catch (e) {}
+          return { status: r.status, ok: r.ok, symbols: symbols, body: symbols ? '' : t.substring(0, 300) };
+        });
+      })
+      .catch(function(e) { return { status: 0, ok: false, symbols: null, body: String(e) }; })
+  `);
+  if (!resp?.ok) {
+    throw new Error(`Watchlist append REST call failed (HTTP ${resp?.status}): ${resp?.body}`);
+  }
+  const missing = resp.symbols ? fresh.filter(s => !resp.symbols.includes(s)) : fresh;
+
+  // Same widget remount as remove(): toggle the panel so the new rows show up.
+  await evaluate(`(function() { var btn = ${WL_BUTTON_JS}; if (btn) btn.click(); })()`);
+  await new Promise(r => setTimeout(r, 400));
+  await evaluate(`(function() { var btn = ${WL_BUTTON_JS}; if (btn) btn.click(); })()`);
+
+  return {
+    success: true, added: fresh, skipped,
+    verified: missing.length === 0,
+    missing,
+    verify_source: resp.symbols ? 'rest' : 'unavailable',
+    list_id: target.id, list_name: target.name, api: 'rest',
+  };
+}
+
 export async function add({ symbol }) {
   const c = await getClient();
   await ensureWatchlistOpen();

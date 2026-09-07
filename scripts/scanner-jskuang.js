@@ -11,14 +11,14 @@
  * 用法：node scripts/scanner-jskuang.js
  */
 
-import { connect, disconnect, evaluate, evaluateAsync, getClient } from '../src/connection.js';
+import { connect, disconnect, evaluateAsync } from '../src/connection.js';
 import { getOhlcv } from '../src/core/data.js';
+import { addToList, findList } from '../src/core/watchlist.js';
 
 const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
 
-// Desktop 版 watchlist 面板按鈕（中文 aria-label）
-const WL_BTN = '[data-name="watchlists-button"]';
-const ADD_BTN = '[data-name="add-symbol-button"]';
+// 符合幣對要加入的雲端清單名稱（透過 REST 指名加入，與目前開啟的頁籤無關）
+const TARGET_LIST = '極速匡';
 // 切換後等待資料載入的固定時間（ms）
 const SYMBOL_WAIT = 700;
 const TF_WAIT = 450;
@@ -51,10 +51,6 @@ function checkSignal(bars, signal) {
   return false;
 }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
 function formatTime(seconds) {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -62,64 +58,6 @@ function formatTime(seconds) {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
-}
-
-async function ensureWatchlistOpen() {
-  const opened = await evaluate(`(function() {
-    var btn = document.querySelector('${WL_BTN}');
-    if (!btn) return false;
-    if (btn.getAttribute('aria-pressed') !== 'true') btn.click();
-    return true;
-  })()`);
-  if (!opened) throw new Error('找不到 Watchlist 按鈕（請確認右側面板已啟用）');
-  // 等待 add-symbol-button 出現
-  const deadline = Date.now() + 4000;
-  while (Date.now() < deadline) {
-    const ready = await evaluate(`!!document.querySelector('${ADD_BTN}')`);
-    if (ready) return;
-    await sleep(250);
-  }
-  throw new Error('Watchlist 面板未就緒');
-}
-
-async function addSymbolToWatchlist(symbol) {
-  const c = await getClient();
-  await ensureWatchlistOpen();
-
-  // 點擊 add-symbol-button
-  const clicked = await evaluate(`(function() {
-    var btn = document.querySelector('${ADD_BTN}');
-    if (!btn) return false;
-    btn.click();
-    return true;
-  })()`);
-  if (!clicked) throw new Error('無法點擊新增按鈕');
-  await sleep(400);
-
-  // 輸入幣對名稱（只輸入 ticker 不含 exchange 前綴）
-  const ticker = symbol.split(':').pop();   // BTCUSDT.P
-  await c.Input.insertText({ text: ticker });
-  await sleep(700);
-  await c.Input.dispatchKeyEvent({ type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-  await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter' });
-  await sleep(300);
-  await c.Input.dispatchKeyEvent({ type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
-  await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Escape', code: 'Escape' });
-  await sleep(300);
-}
-
-async function addBulkToWatchlist(symbols) {
-  let added = 0, failed = 0;
-  for (const sym of symbols) {
-    try {
-      await addSymbolToWatchlist(sym);
-      added++;
-    } catch (err) {
-      console.log(`   ⚠️  ${sym}: ${err.message}`);
-      failed++;
-    }
-  }
-  return { added, failed };
 }
 
 async function fetchBingxSymbols() {
@@ -195,11 +133,18 @@ async function main() {
   await connect();
   console.log('✅ 已連接\n');
 
+  // 先確認目標清單存在，避免掃完才發現無處可加
+  if (!await findList({ name: TARGET_LIST })) {
+    console.error(`❌ 找不到「${TARGET_LIST}」清單，請先在 TradingView 建立後再執行`);
+    await disconnect();
+    process.exit(1);
+  }
+  console.log(`✅ 已找到「${TARGET_LIST}」清單，符合幣對將自動加入（無需手動切換頁籤）\n`);
+
   console.log('📋 取得 BingX USDT 永續合約清單...');
   const rawSymbols = await fetchBingxSymbols();
   const total = rawSymbols.length;
   console.log(`✅ 共 ${total} 個幣對（24h 漲幅前 20 名）\n`);
-  console.log('💡 提示：請先在 TradingView 建立並切換至「極速匡」清單，符合幣對將加入該清單\n');
   console.log('─'.repeat(58));
 
   const matched = [];
@@ -246,9 +191,20 @@ async function main() {
   if (matched.length > 0) {
     matched.forEach(s => console.log(`   • ${s.replace('BINGX:', '').replace('.P', '')}`));
 
-    console.log('\n📥 正在加入 TradingView 清單...');
-    const wlResult = await addBulkToWatchlist(matched);
-    console.log(`✅ 成功加入 ${wlResult.added} 個，失敗 ${wlResult.failed} 個`);
+    console.log(`\n📥 正在加入「${TARGET_LIST}」清單...`);
+    try {
+      const r = await addToList({ list: TARGET_LIST, symbols: matched });
+      const skippedNote = r.skipped.length ? `（另有 ${r.skipped.length} 個已在清單中）` : '';
+      if (!r.added.length) {
+        console.log(`✅ 全部 ${matched.length} 個已在清單中，無需加入`);
+      } else if (r.verified) {
+        console.log(`✅ 成功加入 ${r.added.length} 個${skippedNote}`);
+      } else {
+        console.log(`⚠️  已送出 ${r.added.length} 個，但驗證未確認：${r.missing.join(', ')}${skippedNote}`);
+      }
+    } catch (err) {
+      console.log(`❌ 加入清單失敗: ${err.message}`);
+    }
   } else {
     console.log('   （目前無符合幣對）');
   }
