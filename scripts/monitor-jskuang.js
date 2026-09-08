@@ -83,8 +83,6 @@ function parseStudyNum(v) {
   return parseFloat(m[1]) * mult;
 }
 
-let maStudyWarned = false;
-
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function now() {
@@ -194,6 +192,27 @@ async function waitForChart(symbol, tf, minBars, count, timeoutMs = LOAD_TIMEOUT
     `${tf} 載入逾時（拿到 ${seen} 根，需要 ${minBars} 根；` +
     `序列為 ${last?.symbol ?? '?'} ${last?.interval ?? '?'}）`
   );
+}
+
+// 指標值是在序列載入後才重算的，切換完當下常常還讀不到。
+// 讀不到就當「條件不成立」會靜靜漏掉進場信號 —— 改成輪詢等，
+// 真的等不到就丟錯，由每輪摘要回報，不當作已判斷過。
+async function waitForMaValue(timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const sv = await getStudyValues();
+    const study = sv?.studies?.find(st => st.name && st.name.includes(MA_STUDY_NAME));
+    const val = parseStudyNum(study?.values?.[MA_VALUE_KEY]);
+    if (Number.isFinite(val)) return val;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        study
+          ? `「${MA_STUDY_NAME}」的 ${MA_VALUE_KEY} 讀不到數值`
+          : `圖表上找不到「${MA_STUDY_NAME}」指標（需保持可見）`
+      );
+    }
+    await sleep(POLL_INTERVAL);
+  }
 }
 
 // ─── 讀取雲端自訂清單（權威來源）────────────────────
@@ -369,17 +388,8 @@ async function checkEntry(tvSym) {
     if (!hadBearEngulf) return null;
 
     // 條件2b：3H 收盤需站上 EMA/MA 指標的 MA 線
-    const sv = await getStudyValues();
-    const maStudy = sv?.studies?.find(st => st.name && st.name.includes(MA_STUDY_NAME));
-    if (!maStudy) {
-      if (!maStudyWarned) {
-        maStudyWarned = true;
-        console.warn(`\n  ⚠️  圖表上找不到「${MA_STUDY_NAME}」指標，MA 條件無法判斷，將視為不符合`);
-      }
-      return null;
-    }
-    const maVal = parseStudyNum(maStudy.values?.[MA_VALUE_KEY]);
-    if (!Number.isFinite(maVal) || curr3h.close <= maVal) return null;
+    const maVal = await waitForMaValue();
+    if (curr3h.close <= maVal) return null;
 
     // 條件3：切換至 1H，取最近 3 根收盤連續墊高
     await switchTF('60');
