@@ -42,8 +42,10 @@ After the MCP server is connected, use the `tv_launch` tool — it auto-detects 
 
 Mac:
 ```bash
-/Applications/TradingView.app/Contents/MacOS/TradingView --remote-debugging-port=9222
+open -a TradingView --args --remote-debugging-port=9222
 ```
+
+Do NOT exec the binary directly (`/Applications/TradingView.app/Contents/MacOS/TradingView ...`) from an IDE terminal or agent shell — the inherited mach port restrictions make `chrome_crashpad_handler` crash-loop and spam `FATAL:...mach_port_request_notification: (os/kern) invalid capability` every few seconds. See the Troubleshooting section in `CLAUDE.md`.
 
 Windows:
 
@@ -121,6 +123,8 @@ Then `tv status`, `tv quote`, `tv pine compile`, etc. work from anywhere.
 | `tv` command not found | Run `npm link` from the project directory |
 | Tools return stale data | TradingView may still be loading — wait a few seconds |
 | Pine Editor tools fail | Open the Pine Editor panel first (`ui_open_panel pine-editor open`) |
+| Mac: terminal spammed with `FATAL:...mach_port_request_notification: (os/kern) invalid capability` | TradingView was exec'd directly instead of via launchd — quit it and relaunch with `open -a TradingView --args --remote-debugging-port=9222` (see Troubleshooting in `CLAUDE.md`) |
+| Script says env vars not set despite `.env` being configured | Node doesn't auto-load `.env` — run with `node --env-file=.env scripts/xxx.js` (see Troubleshooting in `CLAUDE.md`) |
 
 ## What to Read Next
 

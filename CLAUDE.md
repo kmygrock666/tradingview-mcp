@@ -120,6 +120,30 @@ These tools can return large payloads. Follow these rules to avoid context bloat
 - OHLCV capped at 500 bars, trades at 20 per request
 - Pine labels capped at 50 per study by default (pass `max_labels` to override)
 
+## Troubleshooting(疑難排解)
+
+### macOS 啟動方式:一定要用 `open`,不要直接執行 binary
+
+```bash
+open -a TradingView --args --remote-debugging-port=9222
+```
+
+直接執行 `/Applications/TradingView.app/Contents/MacOS/TradingView`(尤其是在 VSCode 整合終端機或 Claude Code 沙箱 shell 裡)會讓子程序繼承受限的 mach port 權限,導致 `chrome_crashpad_handler` 啟動失敗、無限重生,終端機每隔幾秒就被這行洗版:
+
+```
+FATAL:...exception_handler_server.cc:76 Check failed: kr == KERN_SUCCESS. mach_port_request_notification: (os/kern) invalid capability
+```
+
+同時 `~/Library/Logs/DiagnosticReports/` 會塞滿 `chrome_crashpad_handler-*.ips`。用 `open` 經由 launchd 啟動就不會有這個問題(在 VSCode 終端機裡執行 `open` 也沒關係)。
+
+### scripts/ 的環境變數:`.env` 不會自動被載入
+
+Node 執行腳本時不會自動讀 `.env`。`scripts/monitor-jskuang.js` 已自帶 `process.loadEnvFile()` 會自動載入專案根目錄的 `.env`;其他腳本若要讀 `.env`,請用:
+
+```bash
+node --env-file=.env scripts/xxx.js
+```
+
 ## Architecture
 
 ```
