@@ -44,8 +44,13 @@ const WATCHLISTS = ['極速匡', '加密貨幣'];
 const MA_STUDY_NAME = '7EMA_5MA';
 const MA_VALUE_KEY = 'MA 1';
 const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
-const SYMBOL_WAIT = 700;
-const TF_WAIT = 450;
+// 切換後的沉澱時間（ms）。資料是否就緒改由 waitForChart 輪詢判定，
+// 這裡只要讓 setSymbol/setResolution 有機會生效即可。
+const SYMBOL_WAIT = 150;
+const TF_WAIT = 100;
+// 等待圖表載入資料的輪詢間隔與逾時（ms）
+const POLL_INTERVAL = 200;
+const LOAD_TIMEOUT = 8000;
 // 心跳：距離上次「掃描完成」超過 間隔 + 寬限 仍沒完成，就發逾時告警。
 // 目的是讓「沒收到訊息」只剩一種解讀 —— 程式整個掛了。
 const HEARTBEAT_GRACE_MIN = 5;
@@ -140,6 +145,32 @@ async function switchTF(tf) {
   await evaluateAsync(`new Promise(r => {
     ${CHART_API}.setResolution(${JSON.stringify(tf)}, {}); setTimeout(r, ${TF_WAIT});
   })`);
+}
+
+// 輪詢等到圖表確實切到目標 symbol/TF 且拿得到足夠 K 棒，取代固定 sleep。
+// 舊做法只等固定毫秒就讀資料，載入慢一點就會拿到空的 bar 序列
+// （"Could not extract OHLCV data"），那一輪該標的等於整個沒被檢查。
+async function waitForChart(symbol, tf, minBars, count, timeoutMs = LOAD_TIMEOUT) {
+  const wantTf = tf === 'D' ? '1D' : tf;   // setResolution('D') 回報為 '1D'
+  const deadline = Date.now() + timeoutMs;
+  let seen = 0;
+  while (Date.now() < deadline) {
+    const state = await evaluate(`(function() {
+      var c = ${CHART_API};
+      return { symbol: c.symbol(), resolution: c.resolution() };
+    })()`);
+    if (state && state.symbol === symbol && state.resolution === wantTf) {
+      try {
+        const result = await getOhlcv({ count });
+        seen = result?.bars?.length || 0;
+        if (seen >= minBars) return result.bars;
+      } catch {
+        // 資料尚未就緒，繼續等
+      }
+    }
+    await sleep(POLL_INTERVAL);
+  }
+  throw new Error(`${tf} 載入逾時（只拿到 ${seen} 根 K 棒，需要 ${minBars} 根）`);
 }
 
 // ─── 讀取雲端自訂清單（權威來源）────────────────────
@@ -251,9 +282,7 @@ async function fetchWatchlists(listNames) {
 async function checkRemoval3D(tvSym) {
   try {
     await switchTo(tvSym, '3D');
-    const d3 = await getOhlcv({ count: 4 });
-    if (!d3 || d3.bars.length < 3) return null;
-    const b = d3.bars;
+    const b = await waitForChart(tvSym, '3D', 3, 4);
     const curr = b[b.length - 1], prev = b[b.length - 2], prev2 = b[b.length - 3];
     if (isBearEngulf(curr, prev)) return '3D黑吞';
     if (prev2 && isBearEngulf(prev, prev2)) return '3D前根黑吞';
@@ -289,9 +318,7 @@ async function checkEntry(tvSym) {
   try {
     // 條件1：1D 當前紅吞，或前一根日K為黑吞/收黑K
     await switchTo(tvSym, 'D');
-    const d1 = await getOhlcv({ count: 3 });
-    if (!d1 || d1.bars.length < 2) return null;
-    const dBars = d1.bars;
+    const dBars = await waitForChart(tvSym, 'D', 2, 3);
     const currD = dBars[dBars.length - 1];
     const prevD = dBars[dBars.length - 2];
     const prev2D = dBars[dBars.length - 3];
@@ -303,9 +330,7 @@ async function checkEntry(tvSym) {
 
     // 條件2：切換至 3H，當前紅吞且前 5 根內曾出現黑吞（黑吞後轉紅吞）
     await switchTF('180');
-    const h3 = await getOhlcv({ count: 7 });
-    if (!h3 || h3.bars.length < 6) return null;
-    const bars3h = h3.bars;
+    const bars3h = await waitForChart(tvSym, '180', 6, 7);
 
     const curr3h = bars3h[bars3h.length - 1];
     const prev3h = bars3h[bars3h.length - 2];
@@ -335,9 +360,7 @@ async function checkEntry(tvSym) {
 
     // 條件3：切換至 1H，取最近 3 根收盤連續墊高
     await switchTF('60');
-    const h1 = await getOhlcv({ count: 4 });
-    if (!h1 || h1.bars.length < 3) return null;
-    const b = h1.bars;
+    const b = await waitForChart(tvSym, '60', 3, 4);
     const h1_higher = b[b.length - 3].close < b[b.length - 2].close &&
       b[b.length - 2].close < b[b.length - 1].close;
     if (!h1_higher) return null;
