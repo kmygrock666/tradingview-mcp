@@ -20,6 +20,9 @@ import { connect, disconnect, evaluate, evaluateAsync } from '../src/connection.
 import { getOhlcv, getStudyValues } from '../src/core/data.js';
 import { remove as wlRemove } from '../src/core/watchlist.js';
 
+// 自動載入專案根目錄的 .env(已用 export 設定或檔案不存在時略過)
+try { process.loadEnvFile(new URL('../.env', import.meta.url)); } catch {}
+
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 if (!TG_TOKEN || !TG_CHAT_ID) {
