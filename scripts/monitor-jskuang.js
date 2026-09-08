@@ -13,6 +13,13 @@
  * 極速匡移除條件（僅極速匡頁籤）：
  *   3D 當前或前一根 K棒為「黑吞」→ 自清單移除並通知
  *
+ * Telegram 通知：
+ *   - 進場信號：每個符合的幣對各發一則（格式未變）
+ *   - 每輪摘要：不論有無符合目標，每輪掃完都發一則（時間／清單與掃描數／結果）
+ *   - 錯誤：讀清單失敗、掃描例外、致命錯誤各自發通知，不靜默吞掉
+ *   - 心跳：超過 間隔 + 5 分鐘 沒完成任何一輪掃描就發逾時告警
+ *   於是「完全沒收到訊息」只剩一種解讀 —— 行程整個掛了。
+ *
  * 用法：node scripts/monitor-jskuang.js [間隔分鐘數，預設 30]
  */
 
@@ -39,6 +46,9 @@ const MA_VALUE_KEY = 'MA 1';
 const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
 const SYMBOL_WAIT = 700;
 const TF_WAIT = 450;
+// 心跳：距離上次「掃描完成」超過 間隔 + 寬限 仍沒完成，就發逾時告警。
+// 目的是讓「沒收到訊息」只剩一種解讀 —— 程式整個掛了。
+const HEARTBEAT_GRACE_MIN = 5;
 
 // 已通知記錄：避免同一根 K 棒重複通知（key = symbol+barTime）
 const notified = new Set();
@@ -69,6 +79,37 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function now() {
   return new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+// 通知內文用的時間戳（含日期，方便在 TG 對照是哪一輪）
+function stamp() {
+  return new Date().toLocaleString('zh-TW', {
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+}
+
+// ─── 心跳監看 ────────────────────────────────────
+// 每次掃描完成後重新計時；逾時代表這一輪卡住了（CDP 沒回應、圖表切不動…）。
+// 行程整個死掉時這個 timer 也跟著沒了 —— 那種情況靠「每輪都發」的沉默來判斷。
+let heartbeatTimer = null;
+
+function armHeartbeat() {
+  if (heartbeatTimer) clearTimeout(heartbeatTimer);
+  const limitMin = INTERVAL_MIN + HEARTBEAT_GRACE_MIN;
+  heartbeatTimer = setTimeout(async () => {
+    console.error(`\n[${now()}] ⏰ 心跳逾時：已 ${limitMin} 分鐘沒有完成掃描`);
+    await notify(
+      '監控器心跳逾時',
+      `時間：${stamp()}\n已超過 ${limitMin} 分鐘沒有完成任何一輪掃描\n可能卡在 CDP／圖表切換，請檢查監控器`,
+      '⏰'
+    );
+  }, limitMin * 60 * 1000);
+  heartbeatTimer.unref?.();
+}
+
+// parse_mode 是 HTML，錯誤訊息可能帶 < & 之類的字元，不跳脫會讓整則發送失敗
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // ─── Telegram 通知 ────────────────────────────────
@@ -302,8 +343,9 @@ async function checkEntry(tvSym) {
     if (!h1_higher) return null;
 
     return { symbol: tvSym, displayName, price: curr3h.close, barTime: curr3h.time, d1Signal };
-  } catch {
-    return null;
+  } catch (e) {
+    // 單一幣對失敗不中斷整輪，但要記下來讓本輪摘要看得到，不靜默吞掉
+    return { error: e.message || String(e) };
   }
 }
 
@@ -315,6 +357,12 @@ async function runScan() {
     lists = await fetchWatchlists(WATCHLISTS);
   } catch (e) {
     console.error('  讀取清單失敗:', e.message);
+    await notify(
+      '監控器掃描錯誤',
+      `時間：${stamp()}\n讀取監控清單失敗：${esc(e.message)}\n本輪未執行，${INTERVAL_MIN} 分鐘後重試`,
+      '❌'
+    );
+    armHeartbeat();
     return;
   }
 
@@ -324,6 +372,7 @@ async function runScan() {
 
   const signals = [];
   const removals = [];
+  const errors = [];         // 單一幣對的例外，彙總進本輪摘要
   const scanned = new Set(); // 同一輪跨清單去重：同幣對只掃一次
   for (const { list, symbols } of lists) {
     console.log(`  ── ${list}（${symbols.length} 個幣對）──`);
@@ -345,7 +394,10 @@ async function runScan() {
       }
       scanned.add(tvSym);
       const result = await checkEntry(tvSym);
-      if (result) {
+      if (result?.error) {
+        errors.push(`${label}：${result.error}`);
+        console.log(`⚠️  ${result.error}`);
+      } else if (result) {
         const key = `${tvSym}-${result.barTime}`;
         if (!notified.has(key)) {
           notified.add(key);
@@ -394,7 +446,41 @@ async function runScan() {
   } else {
     console.log(`  無進場信號`);
   }
+
+  // 每輪都回報一次，讓「沒收到訊息」只剩「監控器掛了」一種解讀
+  const breakdown = lists.map(l => `${l.list} ${l.symbols.length}`).join('、');
+  const summary = [
+    `時間：${stamp()}`,
+    `清單：${breakdown}（實掃 ${scanned.size} 個）`,
+    signals.length > 0
+      ? `結果：${signals.length} 個進場信號（另發個別通知）`
+      : '結果：無符合目標',
+  ];
+  if (removals.length) summary.push(`移除：${removals.length} 個（3D 黑吞）`);
+  if (errors.length) {
+    summary.push(`錯誤：${errors.length} 個`);
+    summary.push(errors.slice(0, 5).map(esc).join('\n'));
+    if (errors.length > 5) summary.push(`…另有 ${errors.length - 5} 個`);
+  }
+  await notify('極速匡掃描完成', summary.join('\n'), signals.length > 0 ? '📋' : '🟢');
+
+  armHeartbeat();
   console.log(`[${now()}] ◀ 掃描完成，下次 ${INTERVAL_MIN} 分鐘後`);
+}
+
+// runScan 的例外不該讓監控器安靜地停擺：通知後照常等下一輪
+async function safeScan() {
+  try {
+    await runScan();
+  } catch (e) {
+    console.error(`\n[${now()}] ❌ 掃描例外:`, e.message);
+    await notify(
+      '監控器掃描錯誤',
+      `時間：${stamp()}\n本輪掃描中斷：${esc(e.message)}\n${INTERVAL_MIN} 分鐘後重試`,
+      '❌'
+    );
+    armHeartbeat();
+  }
 }
 
 // ─── 主程式 ──────────────────────────────────────
@@ -409,14 +495,22 @@ async function main() {
   await connect();
   console.log('✅ 已連接 TradingView CDP\n');
 
+  // 先起心跳：第一輪就卡住也要抓得到
+  armHeartbeat();
+
   // 立即執行第一次
-  await runScan();
+  await safeScan();
 
   // 定時循環
-  setInterval(runScan, INTERVAL_MIN * 60 * 1000);
+  setInterval(safeScan, INTERVAL_MIN * 60 * 1000);
 }
 
-main().catch(err => {
+main().catch(async err => {
   console.error('\n❌ 監控器錯誤:', err.message);
+  await notify(
+    '監控器已停止',
+    `時間：${stamp()}\n致命錯誤：${esc(err.message)}\n監控器已結束，需要手動重啟`,
+    '💀'
+  );
   process.exit(1);
 });
