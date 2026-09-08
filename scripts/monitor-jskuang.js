@@ -44,6 +44,11 @@ const WATCHLISTS = ['極速匡', '加密貨幣'];
 const MA_STUDY_NAME = '7EMA_5MA';
 const MA_VALUE_KEY = 'MA 1';
 const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
+// 主序列本身（K 棒的真正來源）。widget 的 symbol()/resolution() 會在資料
+// 換好之前就先更新，只能拿它當「已下指令」看，不能當「資料已就緒」用。
+const MAIN_SERIES = `${CHART_API}._chartWidget.model().mainSeries()`;
+// 各週期的 K 棒間距（秒），用來確認讀到的序列真的是這個週期
+const TF_SECONDS = { '60': 3600, '180': 10800, 'D': 86400, '3D': 259200 };
 // 切換後的沉澱時間（ms）。資料是否就緒改由 waitForChart 輪詢判定，
 // 這裡只要讓 setSymbol/setResolution 有機會生效即可。
 const SYMBOL_WAIT = 150;
@@ -147,30 +152,48 @@ async function switchTF(tf) {
   })`);
 }
 
-// 輪詢等到圖表確實切到目標 symbol/TF 且拿得到足夠 K 棒，取代固定 sleep。
-// 舊做法只等固定毫秒就讀資料，載入慢一點就會拿到空的 bar 序列
-// （"Could not extract OHLCV data"），那一輪該標的等於整個沒被檢查。
+// 輪詢等到「主序列本身」確實換成目標 symbol/TF 且 K 棒間距正確，才回傳資料。
+//
+// 兩層把關缺一不可：
+//   1. 用 mainSeries 自己回報的 symbolInfo/interval，而不是 widget 的
+//      symbol()/resolution() —— 後者在資料換好前就先更新了，照它判斷會
+//      讀到上一個標的或上一個週期的 K 棒，卻以為是新的。
+//   2. 再核對 K 棒間距等於該週期的秒數，序列還沒換掉就一定對不上。
+//
+// 這是「明明沒有黑吞卻被移出極速匡」的元凶：3D 檢查實際拿到的是上一輪
+// 停留的 1H 序列，用它算吞噬等於在擲骰子。
 async function waitForChart(symbol, tf, minBars, count, timeoutMs = LOAD_TIMEOUT) {
   const wantTf = tf === 'D' ? '1D' : tf;   // setResolution('D') 回報為 '1D'
+  const wantSec = TF_SECONDS[tf];
   const deadline = Date.now() + timeoutMs;
   let seen = 0;
+  let last = null;
   while (Date.now() < deadline) {
     const state = await evaluate(`(function() {
-      var c = ${CHART_API};
-      return { symbol: c.symbol(), resolution: c.resolution() };
+      try {
+        var ms = ${MAIN_SERIES};
+        var si = ms.symbolInfo();
+        return { symbol: si && si.full_name, interval: ms.interval() };
+      } catch (e) { return null; }
     })()`);
-    if (state && state.symbol === symbol && state.resolution === wantTf) {
+    last = state;
+    if (state && state.symbol === symbol && state.interval === wantTf) {
       try {
         const result = await getOhlcv({ count });
-        seen = result?.bars?.length || 0;
-        if (seen >= minBars) return result.bars;
+        const bars = result?.bars || [];
+        seen = bars.length;
+        const spacingOk = bars.length >= 2 && (!wantSec || bars[1].time - bars[0].time === wantSec);
+        if (seen >= minBars && spacingOk) return bars;
       } catch {
         // 資料尚未就緒，繼續等
       }
     }
     await sleep(POLL_INTERVAL);
   }
-  throw new Error(`${tf} 載入逾時（只拿到 ${seen} 根 K 棒，需要 ${minBars} 根）`);
+  throw new Error(
+    `${tf} 載入逾時（拿到 ${seen} 根，需要 ${minBars} 根；` +
+    `序列為 ${last?.symbol ?? '?'} ${last?.interval ?? '?'}）`
+  );
 }
 
 // ─── 讀取雲端自訂清單（權威來源）────────────────────

@@ -27,6 +27,11 @@ if (!TG_TOKEN || !TG_CHAT_ID) {
 }
 
 const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
+// 主序列本身（K 棒的真正來源）。widget 的 symbol()/resolution() 會在資料
+// 換好之前就先更新，只能拿它當「已下指令」看，不能當「資料已就緒」用。
+const MAIN_SERIES = `${CHART_API}._chartWidget.model().mainSeries()`;
+// 各週期的 K 棒間距（秒），用來確認讀到的序列真的是這個週期
+const TF_SECONDS = { '180': 10800, 'D': 86400, '3D': 259200, '18D': 1555200 };
 
 // 符合幣對要加入的雲端清單名稱（透過 REST 指名加入，與目前開啟的頁籤無關）
 const TARGET_LIST = '極速匡';
@@ -140,25 +145,38 @@ async function chartSetTimeframe(tf) {
 // 輪詢等待圖表確實切到目標 symbol/TF 且拿得到 K 棒，取代固定 sleep
 async function waitForChart(symbol, tf, minBars = 2, timeoutMs = LOAD_TIMEOUT) {
   const wantTf = tf === 'D' ? '1D' : tf;   // setResolution('D') 回報為 '1D'
+  const wantSec = TF_SECONDS[tf];
   const deadline = Date.now() + timeoutMs;
   let seen = 0;
+  let last = null;
   while (Date.now() < deadline) {
+    // 以主序列自己回報的 symbol/interval 為準，並核對 K 棒間距：widget 的
+    // symbol()/resolution() 會在資料換好前就更新，照它判斷會拿到上一個
+    // 標的或上一個週期的 K 棒，卻誤以為是新的。
     const state = await evaluate(`(function() {
-      var c = ${CHART_API};
-      return { symbol: c.symbol(), resolution: c.resolution() };
+      try {
+        var ms = ${MAIN_SERIES};
+        var si = ms.symbolInfo();
+        return { symbol: si && si.full_name, interval: ms.interval() };
+      } catch (e) { return null; }
     })()`);
-    if (state && state.symbol === symbol && state.resolution === wantTf) {
+    last = state;
+    if (state && state.symbol === symbol && state.interval === wantTf) {
       try {
         const result = await getOhlcv({ count: 3 });
-        seen = result?.bars?.length || 0;
-        if (seen >= minBars) return result.bars;
+        const bars = result?.bars || [];
+        seen = bars.length;
+        const spacingOk = bars.length >= 2 && (!wantSec || bars[1].time - bars[0].time === wantSec);
+        if (seen >= minBars && spacingOk) return bars;
       } catch {
         // 資料尚未就緒，繼續等
       }
     }
     await sleep(POLL_INTERVAL);
   }
-  throw new Error(`載入逾時（只拿到 ${seen} 根 K 棒）`);
+  throw new Error(
+    `載入逾時（拿到 ${seen} 根；序列為 ${last?.symbol ?? '?'} ${last?.interval ?? '?'}）`
+  );
 }
 
 async function scanSymbol(tvSymbol) {
