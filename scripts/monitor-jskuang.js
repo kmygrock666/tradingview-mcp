@@ -89,6 +89,11 @@ function now() {
   return new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+// K 棒時間 → MM/DD，用在移除依據裡標明是哪一根
+function day(bar) {
+  return new Date(bar.time * 1000).toLocaleDateString('zh-TW', { month: '2-digit', day: '2-digit' });
+}
+
 // 通知內文用的時間戳（含日期，方便在 TG 對照是哪一輪）
 function stamp() {
   return new Date().toLocaleString('zh-TW', {
@@ -326,8 +331,19 @@ async function checkRemoval3D(tvSym) {
     await switchTo(tvSym, '3D');
     const b = await waitForChart(tvSym, '3D', 3, 4);
     const curr = b[b.length - 1], prev = b[b.length - 2], prev2 = b[b.length - 3];
-    if (isBearEngulf(curr, prev)) return '3D黑吞';
-    if (prev2 && isBearEngulf(prev, prev2)) return '3D前根黑吞';
+    // 附上判定依據的數字，讓通知可以直接被覆核，不必回頭開圖表對
+    if (isBearEngulf(curr, prev)) {
+      return {
+        reason: '3D黑吞',
+        detail: `${day(curr)} 收${curr.close}＜前根實體低${Math.min(prev.open, prev.close)}`,
+      };
+    }
+    if (prev2 && isBearEngulf(prev, prev2)) {
+      return {
+        reason: '3D前根黑吞',
+        detail: `${day(prev)} 收${prev.close}＜前根實體低${Math.min(prev2.open, prev2.close)}`,
+      };
+    }
     return null;
   } catch {
     return null;
@@ -441,10 +457,10 @@ async function runScan() {
       }
       // 移除條件僅適用極速匡：3D 當前或前一根黑吞 → 待移除，跳過進場檢查
       if (list === '極速匡') {
-        const removalReason = await checkRemoval3D(tvSym);
-        if (removalReason) {
-          removals.push({ tvSym, displayName: label, reason: removalReason });
-          console.log(`🗑 ${removalReason} → 待移除`);
+        const removal = await checkRemoval3D(tvSym);
+        if (removal) {
+          removals.push({ tvSym, displayName: label, ...removal });
+          console.log(`🗑 ${removal.reason} → 待移除（${removal.detail}）`);
           continue;
         }
       }
@@ -468,25 +484,31 @@ async function runScan() {
     }
   }
 
+  // 移除結果要進本輪摘要：標的、理由、判定依據都列出來，才能被覆核
+  let removalNote = null;
   if (removals.length > 0) {
     console.log(`\n  🗑 自極速匡移除：${removals.map(r => r.displayName).join(', ')}`);
     try {
       const res = await removeFromList('極速匡', removals.map(r => r.tvSym));
-      // 只有真的移除成功才通知，否則每輪都會重掃到同一批幣對而重複發送。
+      // 只有真的移除成功才發專門的移除通知，否則每輪都會重掃到同一批幣對
+      // 而重複發送。未成功的情況改由本輪摘要交代，不會靜悄悄。
       if (!res.verified) {
-        console.warn('  ⚠️  移除未通過驗證，下次掃描將重試（不發通知）');
+        removalNote = `移除未確認（下輪重試）：\n${removals.map(r => `${r.displayName}（${r.reason}：${r.detail}）`).join('\n')}`;
+        console.warn('  ⚠️  移除未通過驗證，下次掃描將重試（不發專門通知，摘要會列出）');
       } else {
+        removalNote = `已移除：\n${removals.map(r => `${r.displayName}（${r.reason}：${r.detail}）`).join('\n')}`;
         const fresh = removals.filter(r => !removeNotified.has(r.tvSym));
         if (fresh.length) {
           for (const r of fresh) removeNotified.add(r.tvSym);
           await notify(
             '極速匡移除訊號',
-            fresh.map(r => `${r.displayName}（${r.reason}）`).join('\n'),
+            fresh.map(r => `${r.displayName}（${r.reason}）\n　依據：${esc(r.detail)}`).join('\n'),
             '🗑'
           );
         }
       }
     } catch (e) {
+      removalNote = `移除失敗（下輪重試）：${e.message}\n${removals.map(r => `${r.displayName}（${r.reason}：${r.detail}）`).join('\n')}`;
       console.error('  ⚠️  移除失敗（下次掃描將重試）:', e.message);
     }
   }
@@ -512,7 +534,7 @@ async function runScan() {
       ? `結果：${signals.length} 個進場信號（另發個別通知）`
       : '結果：無符合目標',
   ];
-  if (removals.length) summary.push(`移除：${removals.length} 個（3D 黑吞）`);
+  if (removalNote) summary.push(esc(removalNote));
   if (errors.length) {
     summary.push(`錯誤：${errors.length} 個`);
     summary.push(errors.slice(0, 5).map(esc).join('\n'));
