@@ -25,7 +25,7 @@
 
 import { connect, disconnect, evaluate, evaluateAsync } from '../src/connection.js';
 import { getOhlcv, getStudyValues } from '../src/core/data.js';
-import { remove as wlRemove } from '../src/core/watchlist.js';
+import { removeFromList } from '../src/core/watchlist.js';
 
 // 自動載入專案根目錄的 .env(已用 export 設定或檔案不存在時略過)
 try { process.loadEnvFile(new URL('../.env', import.meta.url)); } catch {}
@@ -350,24 +350,6 @@ async function checkRemoval3D(tvSym) {
   }
 }
 
-// ─── 切換至指定清單頁籤後移除幣對 ────────────────────
-async function removeFromList(listName, symbols) {
-  const activated = await evaluateAsync(`(async function() {
-    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-    var wlBtn = document.querySelector('[data-name="watchlists-button"]');
-    if (wlBtn && wlBtn.getAttribute('aria-pressed') !== 'true') { wlBtn.click(); await sleep(600); }
-    var btns = document.querySelectorAll('button[aria-label]');
-    for (var b of btns) {
-      if (b.getAttribute('aria-label') === ${JSON.stringify(listName)}) {
-        if (b.getAttribute('aria-pressed') !== 'true') { b.click(); await sleep(700); }
-        return true;
-      }
-    }
-    return false;
-  })()`);
-  if (!activated) throw new Error(`找不到「${listName}」清單頁籤`);
-  return wlRemove({ symbols });
-}
 
 // ─── 檢查單一幣對的進場條件 ──────────────────────────
 // tvSym 為完整格式，如 "OKX:ENAUSDT.P"
@@ -489,7 +471,7 @@ async function runScan() {
   if (removals.length > 0) {
     console.log(`\n  🗑 自極速匡移除：${removals.map(r => r.displayName).join(', ')}`);
     try {
-      const res = await removeFromList('極速匡', removals.map(r => r.tvSym));
+      const res = await removeFromList({ list: '極速匡', symbols: removals.map(r => r.tvSym) });
       // 只有真的移除成功才發專門的移除通知，否則每輪都會重掃到同一批幣對
       // 而重複發送。未成功的情況改由本輪摘要交代，不會靜悄悄。
       if (!res.verified) {

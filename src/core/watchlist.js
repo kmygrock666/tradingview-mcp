@@ -202,6 +202,59 @@ export async function addToList({ list, symbols }) {
   };
 }
 
+// Remove symbols from a named cloud list without touching the active tab.
+//
+// remove() decides what to remove by matching against the ACTIVE widget's
+// cached symbol array, which the desktop app can serve stale for a long time
+// after a REST change — observed serving 17 rows while the API held 26. A
+// symbol missing from that stale copy is reported as "no matching symbols",
+// so a caller that retries on !verified retries forever and the removal never
+// happens. Resolve the list by name over REST instead, like addToList.
+export async function removeFromList({ list, symbols }) {
+  const target = await findList({ name: list });
+  if (!target) throw new Error(`Custom watchlist "${list}" not found — create it in TradingView first`);
+
+  const existing = new Set(target.symbols);
+  const present = symbols.filter(s => existing.has(s));
+  const skipped = symbols.filter(s => !existing.has(s));
+  if (!present.length) {
+    return {
+      success: true, removed: [], skipped, verified: true, still_present: [],
+      list_id: target.id, list_name: target.name, api: 'rest',
+    };
+  }
+
+  const resp = await evaluateAsync(`
+    fetch(location.origin + '/api/v1/symbols_list/custom/' + ${JSON.stringify(target.id)} + '/remove/', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify(${JSON.stringify(present)}),
+    })
+      .then(function(r) { return r.text().then(function(t) { return { status: r.status, ok: r.ok, body: t.substring(0, 300) }; }); })
+      .catch(function(e) { return { status: 0, ok: false, body: String(e) }; })
+  `);
+  if (!resp?.ok) {
+    throw new Error(`Watchlist remove REST call failed (HTTP ${resp?.status}): ${resp?.body}`);
+  }
+
+  // Same widget remount as remove(): the panel doesn't live-sync API changes.
+  await evaluate(`(function() { var btn = ${WL_BUTTON_JS}; if (btn) btn.click(); })()`);
+  await new Promise(r => setTimeout(r, 400));
+  await evaluate(`(function() { var btn = ${WL_BUTTON_JS}; if (btn) btn.click(); })()`);
+
+  const after = await findList({ name: list });
+  const stillPresent = after ? present.filter(s => after.symbols.includes(s)) : present;
+
+  return {
+    success: true, removed: present, skipped,
+    verified: stillPresent.length === 0,
+    still_present: stillPresent,
+    verify_source: after ? 'rest' : 'unavailable',
+    list_id: target.id, list_name: target.name, api: 'rest',
+  };
+}
+
 export async function add({ symbol }) {
   const c = await getClient();
   await ensureWatchlistOpen();
