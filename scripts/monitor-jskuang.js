@@ -10,10 +10,10 @@
  *      且收盤站上「7EMA_5MA」指標的 MA 線（MA 1）
  *   3. 最近 3 根 1H K棒收盤連續墊高（底底高）
  *
- * 極速匡移除條件（僅極速匡頁籤，任一成立即移除並通知）：
- *   1. 3D 當前或前一根 K棒為「黑吞」
- *   2. 3D 上漲結構被破壞：往回找最近一根「紅吞」K棒（上漲趨勢的錨點），
- *      當前收盤跌破該紅吞 K棒的最低價（含下影線）
+ * 極速匡移除條件（僅極速匡頁籤）：
+ *   3D 上漲結構被破壞 → 自清單移除並通知。
+ *   往回找最後一次「紅吞」K棒（上漲趨勢的錨點），當前收盤跌破該根的
+ *   最低價（含下影線）即成立。單純出現 3D 黑吞但沒收破紅吞低點不算。
  *
  * Telegram 通知：
  *   - 進場信號：每個符合的幣對各發一則（格式未變）
@@ -338,31 +338,19 @@ async function fetchWatchlists(listNames) {
   return lists;
 }
 
-// ─── 檢查極速匡移除條件：3D 黑吞，或跌破最近紅吞的最低價 ──────────
+// ─── 檢查極速匡移除條件：3D 收破最後一次紅吞的最低價 ──────────
 async function checkRemoval3D(tvSym) {
   try {
     await switchTo(tvSym, '3D');
     const b = await waitForChart(tvSym, '3D', 3, REMOVAL_BARS_3D);
-    const curr = b[b.length - 1], prev = b[b.length - 2], prev2 = b[b.length - 3];
-    // 附上判定依據的數字，讓通知可以直接被覆核，不必回頭開圖表對
-    if (isBearEngulf(curr, prev)) {
-      return {
-        reason: '3D黑吞',
-        detail: `${day(curr)} 收${curr.close}＜前根實體低${Math.min(prev.open, prev.close)}`,
-      };
-    }
-    if (prev2 && isBearEngulf(prev, prev2)) {
-      return {
-        reason: '3D前根黑吞',
-        detail: `${day(prev)} 收${prev.close}＜前根實體低${Math.min(prev2.open, prev2.close)}`,
-      };
-    }
-    // 上漲結構被破壞：往回找最近一根紅吞（上漲趨勢的錨點），當前收盤跌破
-    // 它的最低價（含下影線，不是實體低）就移除。從前一根起找：紅吞本身
-    // 收盤必高於開盤，不可能跌破自己的低點。
+    const curr = b[b.length - 1];
+    // 往回找最後一次紅吞（上漲趨勢的錨點），當前收盤跌破它的最低價
+    // （含下影線，不是實體低）就移除。從前一根起找：紅吞本身收盤必高於
+    // 開盤，不可能跌破自己的低點。
     const anchorIdx = findLastBullEngulfIdx(b, b.length - 2);
     if (anchorIdx >= 0 && curr.close < b[anchorIdx].low) {
       const anchor = b[anchorIdx];
+      // 附上判定依據的數字，讓通知可以直接被覆核，不必回頭開圖表對
       return {
         reason: '3D跌破紅吞低',
         detail: `${day(curr)} 收${curr.close}＜${day(anchor)} 紅吞低${anchor.low}`,
