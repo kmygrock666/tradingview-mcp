@@ -10,8 +10,10 @@
  *      且收盤站上「7EMA_5MA」指標的 MA 線（MA 1）
  *   3. 最近 3 根 1H K棒收盤連續墊高（底底高）
  *
- * 極速匡移除條件（僅極速匡頁籤）：
- *   3D 當前或前一根 K棒為「黑吞」→ 自清單移除並通知
+ * 極速匡移除條件（僅極速匡頁籤，任一成立即移除並通知）：
+ *   1. 3D 當前或前一根 K棒為「黑吞」
+ *   2. 3D 上漲結構被破壞：往回找最近一根「紅吞」K棒（上漲趨勢的錨點），
+ *      當前收盤跌破該紅吞 K棒的最低價（含下影線）
  *
  * Telegram 通知：
  *   - 進場信號：每個符合的幣對各發一則（格式未變）
@@ -59,6 +61,8 @@ const LOAD_TIMEOUT = 8000;
 // 心跳：距離上次「掃描完成」超過 間隔 + 寬限 仍沒完成，就發逾時告警。
 // 目的是讓「沒收到訊息」只剩一種解讀 —— 程式整個掛了。
 const HEARTBEAT_GRACE_MIN = 5;
+// 3D 移除條件往回看的 K 棒數：要夠長才找得到當作上漲錨點的那根紅吞
+const REMOVAL_BARS_3D = 12;
 
 // 已通知記錄：避免同一根 K 棒重複通知（key = symbol+barTime）
 const notified = new Set();
@@ -72,6 +76,15 @@ function isBullEngulf(c, p) {
 }
 function isBearEngulf(c, p) {
   return c.close < c.open && c.close < Math.min(p.open, p.close);
+}
+
+// 往回找最近一根「紅吞」K 棒的索引（從 fromIdx 起往前，找不到回 -1）。
+// 這根紅吞就是上漲趨勢的錨點：它的最低價被收盤跌破，等於結構被破壞。
+function findLastBullEngulfIdx(bars, fromIdx) {
+  for (let i = Math.min(fromIdx, bars.length - 1); i >= 1; i--) {
+    if (isBullEngulf(bars[i], bars[i - 1])) return i;
+  }
+  return -1;
 }
 
 // 資料視窗的數值是格式化字串（可能含千分位逗號或 K/M/B 後綴）
@@ -325,11 +338,11 @@ async function fetchWatchlists(listNames) {
   return lists;
 }
 
-// ─── 檢查極速匡移除條件：3D 當前或前一根黑吞 ──────────
+// ─── 檢查極速匡移除條件：3D 黑吞，或跌破最近紅吞的最低價 ──────────
 async function checkRemoval3D(tvSym) {
   try {
     await switchTo(tvSym, '3D');
-    const b = await waitForChart(tvSym, '3D', 3, 4);
+    const b = await waitForChart(tvSym, '3D', 3, REMOVAL_BARS_3D);
     const curr = b[b.length - 1], prev = b[b.length - 2], prev2 = b[b.length - 3];
     // 附上判定依據的數字，讓通知可以直接被覆核，不必回頭開圖表對
     if (isBearEngulf(curr, prev)) {
@@ -342,6 +355,17 @@ async function checkRemoval3D(tvSym) {
       return {
         reason: '3D前根黑吞',
         detail: `${day(prev)} 收${prev.close}＜前根實體低${Math.min(prev2.open, prev2.close)}`,
+      };
+    }
+    // 上漲結構被破壞：往回找最近一根紅吞（上漲趨勢的錨點），當前收盤跌破
+    // 它的最低價（含下影線，不是實體低）就移除。從前一根起找：紅吞本身
+    // 收盤必高於開盤，不可能跌破自己的低點。
+    const anchorIdx = findLastBullEngulfIdx(b, b.length - 2);
+    if (anchorIdx >= 0 && curr.close < b[anchorIdx].low) {
+      const anchor = b[anchorIdx];
+      return {
+        reason: '3D跌破紅吞低',
+        detail: `${day(curr)} 收${curr.close}＜${day(anchor)} 紅吞低${anchor.low}`,
       };
     }
     return null;
