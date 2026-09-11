@@ -3,6 +3,7 @@ screenshots/
 scripts/current.pine
 temp_*
 *.log
+*.log.prev
 discovery-log.json
 rules.json
 
