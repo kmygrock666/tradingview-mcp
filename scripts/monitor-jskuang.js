@@ -63,6 +63,8 @@ const LOAD_TIMEOUT = 8000;
 const HEARTBEAT_GRACE_MIN = 5;
 // 3D 移除條件往回看的 K 棒數：要夠長才找得到當作上漲錨點的那根紅吞
 const REMOVAL_BARS_3D = 12;
+// Telegram 發送逾時（ms）。Node fetch 預設不逾時，卡住會拖垮整輪。
+const TG_TIMEOUT_MS = 10000;
 
 // 已通知記錄：避免同一根 K 棒重複通知（key = symbol+barTime）
 const notified = new Set();
@@ -142,14 +144,21 @@ function esc(s) {
 async function notify(title, message, emoji = '🚀') {
   try {
     const text = `${emoji} <b>${title}</b>\n${message}`;
+    // Node 的 fetch 預設不逾時：TG 端卡住會讓整輪掃描一起吊死
     const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'HTML' }),
+      signal: AbortSignal.timeout(TG_TIMEOUT_MS),
     });
     const json = await res.json();
-    if (!json.ok) console.error('TG 發送失敗:', json.description);
+    // 同時寫進主 log：只寫 stderr 的話 tail log 看不到，會誤判成行程死了
+    if (!json.ok) {
+      console.log(`  ⚠️  TG 發送失敗：${json.description}`);
+      console.error('TG 發送失敗:', json.description);
+    }
   } catch (e) {
+    console.log(`  ⚠️  TG 通知錯誤：${e.message}`);
     console.error('TG 通知錯誤:', e.message);
   }
 }
@@ -237,20 +246,28 @@ async function waitForMaValue(timeoutMs = 3000) {
 // 桌面版 widget 不會即時同步 API 的異動：移除成功後畫面仍留著舊的 row。
 // 改以 REST 為準，否則下一輪會掃到已移除的殭屍標的並重複通知。
 async function fetchCustomLists() {
-  const lists = await evaluateAsync(`
+  // 失敗不能回空陣列：那會讓「REST 掛了」和「沒有任何自訂清單」完全同形，
+  // 接著退去讀 DOM、讀到 0 個標的，最後發出一則綠燈的「無符合目標」。
+  const res = await evaluateAsync(`
     fetch(location.origin + '/api/v1/symbols_list/custom/', {
       credentials: 'include',
       headers: { 'X-Requested-With': 'XMLHttpRequest' },
     })
-      .then(function(r) { return r.json(); })
-      .then(function(j) {
-        return Array.isArray(j)
-          ? j.map(function(x) { return { id: x.id, name: x.name, symbols: x.symbols || [] }; })
-          : [];
+      .then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
       })
-      .catch(function() { return []; })
+      .then(function(j) {
+        return { ok: true, lists: Array.isArray(j)
+          ? j.map(function(x) { return { id: x.id, name: x.name, symbols: x.symbols || [] }; })
+          : [] };
+      })
+      .catch(function(e) { return { ok: false, error: String((e && e.message) || e) }; })
   `);
-  return lists || [];
+  if (!res || res.ok !== true) {
+    throw new Error(`讀取雲端自訂清單失敗：${res?.error || 'CDP 無回應'}`);
+  }
+  return res.lists || [];
 }
 
 // ─── 從 TradingView 讀取多個清單頁籤的幣對 ──────────
@@ -342,13 +359,17 @@ async function fetchWatchlists(listNames) {
 async function checkRemoval3D(tvSym) {
   try {
     await switchTo(tvSym, '3D');
-    const b = await waitForChart(tvSym, '3D', 3, REMOVAL_BARS_3D);
+    // 最少 2 根即可：不足以構成錨點時會走 noAnchor（資料太短），
+    // 不該當成故障每輪報錯 —— 新上市幣對 3D 只有 1~2 根是常態。
+    const b = await waitForChart(tvSym, '3D', 2, REMOVAL_BARS_3D);
     const curr = b[b.length - 1];
     // 往回找最後一次紅吞（上漲趨勢的錨點），當前收盤跌破它的最低價
     // （含下影線，不是實體低）就移除。從前一根起找：紅吞本身收盤必高於
     // 開盤，不可能跌破自己的低點。
     const anchorIdx = findLastBullEngulfIdx(b, b.length - 2);
-    if (anchorIdx >= 0 && curr.close < b[anchorIdx].low) {
+    // 找不到錨點（資料太短或近期無紅吞）不是「沒跌破」，要分得出來
+    if (anchorIdx < 0) return { noAnchor: true };
+    if (curr.close < b[anchorIdx].low) {
       const anchor = b[anchorIdx];
       // 附上判定依據的數字，讓通知可以直接被覆核，不必回頭開圖表對
       return {
@@ -357,8 +378,10 @@ async function checkRemoval3D(tvSym) {
       };
     }
     return null;
-  } catch {
-    return null;
+  } catch (e) {
+    // 吞掉例外等於把「圖表載入失敗」當成「不用移除」，標的會靜靜留在清單裡。
+    // 比照 checkEntry 回報錯誤，由本輪摘要交代。
+    return { error: e.message || String(e) };
   }
 }
 
@@ -432,9 +455,29 @@ async function runScan() {
     return;
   }
 
-  // 已離開極速匡的幣對：清掉移除通知記錄，日後重新加回才會再通知
-  const jskSymbols = new Set(lists.find(l => l.list === '極速匡')?.symbols || []);
-  for (const s of removeNotified) if (!jskSymbols.has(s)) removeNotified.delete(s);
+  // 清單讀到 0 個標的代表讀取管道壞了，不是「今天沒標的」。
+  // 全空就當這輪失敗，否則會發出一則跟平靜盤勢一模一樣的綠燈摘要。
+  const emptyLists = lists.filter(l => !l.symbols.length).map(l => l.list);
+  if (emptyLists.length === lists.length) {
+    const msg = `所有監控清單都讀到 0 個標的（${emptyLists.join('、')}）`;
+    console.error('  ❌', msg);
+    await notify(
+      '監控器掃描錯誤',
+      `時間：${stamp()}\n${esc(msg)}\n本輪未執行，${INTERVAL_MIN} 分鐘後重試`,
+      '❌'
+    );
+    armHeartbeat();
+    return;
+  }
+  if (emptyLists.length) console.warn(`  ⚠️  讀到 0 個標的的清單：${emptyLists.join('、')}`);
+
+  // 已離開極速匡的幣對：清掉移除通知記錄，日後重新加回才會再通知。
+  // 極速匡本身沒讀到時跳過，否則會清空記錄、下輪把整批移除通知重發一次。
+  const jskList = lists.find(l => l.list === '極速匡');
+  if (jskList?.symbols.length) {
+    const jskSymbols = new Set(jskList.symbols);
+    for (const s of removeNotified) if (!jskSymbols.has(s)) removeNotified.delete(s);
+  }
 
   const signals = [];
   const removals = [];
@@ -449,10 +492,20 @@ async function runScan() {
         console.log('⏭ (其他清單已掃)');
         continue;
       }
-      // 移除條件僅適用極速匡：3D 當前或前一根黑吞 → 待移除，跳過進場檢查
+      // 移除條件僅適用極速匡：3D 收破最後一次紅吞的最低價 → 待移除，跳過進場檢查
       if (list === '極速匡') {
         const removal = await checkRemoval3D(tvSym);
-        if (removal) {
+        if (removal?.error) {
+          // 移除狀態不明時不做進場判斷：寧可這輪跳過，也不要對一個
+          // 可能該被移除的標的發進場信號
+          errors.push(`${label}：移除檢查失敗 — ${removal.error}`);
+          console.log(`⚠️  移除檢查失敗：${removal.error}`);
+          continue;
+        }
+        if (removal?.noAnchor) {
+          // 只印在 log，不進 TG：這是資料狀態，不是故障
+          process.stdout.write('（無紅吞錨點）');
+        } else if (removal) {
           removals.push({ tvSym, displayName: label, ...removal });
           console.log(`🗑 ${removal.reason} → 待移除（${removal.detail}）`);
           continue;
@@ -528,6 +581,7 @@ async function runScan() {
       ? `結果：${signals.length} 個進場信號（另發個別通知）`
       : '結果：無符合目標',
   ];
+  if (emptyLists.length) summary.push(`⚠️ 讀到 0 個標的的清單：${esc(emptyLists.join('、'))}`);
   if (removalNote) summary.push(esc(removalNote));
   if (errors.length) {
     summary.push(`錯誤：${errors.length} 個`);

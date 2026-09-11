@@ -37,6 +37,11 @@ const TF_SECONDS = { '180': 10800, 'D': 86400, '3D': 259200, '18D': 1555200 };
 const TARGET_LIST = '極速匡';
 // 切換後的沉澱時間（ms）。資料是否就緒改由 waitForChart 輪詢判定，
 // 這裡只要讓 setSymbol/setResolution 有機會生效即可。
+// 連續這麼多個標的讀不到資料就中止：CDP 卡住時每個標的都會「無資料」，
+// 跑完整輪會印出「掃描完成、無符合幣對」，跟真的沒符合完全同形。
+const MAX_CONSECUTIVE_FAILS = 5;
+// Telegram 發送逾時（ms）。Node fetch 預設不逾時。
+const TG_TIMEOUT_MS = 10000;
 const SYMBOL_WAIT = 150;
 const TF_WAIT = 100;
 // 等待圖表載入資料的輪詢間隔與逾時（ms）
@@ -97,6 +102,7 @@ async function notify(title, message, emoji = '🆕') {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'HTML' }),
+      signal: AbortSignal.timeout(TG_TIMEOUT_MS),
     });
     const json = await res.json();
     if (!json.ok) console.error('TG 發送失敗:', json.description);
@@ -230,6 +236,7 @@ async function main() {
 
   const matched = [];
   const failed = [];
+  let consecutiveFails = 0;   // 連續讀不到資料的次數，用來中止整輪
   const startTime = Date.now();
 
   for (let i = 0; i < rawSymbols.length; i++) {
@@ -244,13 +251,24 @@ async function main() {
     if (result.pass) {
       console.log('✅ 符合');
       matched.push(tvSymbol);
+      consecutiveFails = 0;
     } else if (result.reason === 'no_data') {
       console.log(`⚠️  無資料(${result.failedAt})`);
+      consecutiveFails++;
     } else if (result.reason) {
       console.log(`⚠️  ${result.reason}`);
       failed.push(raw);
+      consecutiveFails++;
     } else {
       console.log(`❌ ${result.failedAt}`);
+      consecutiveFails = 0;   // 條件不成立代表資料讀得到，管道是通的
+    }
+
+    // 熔斷：資料管道壞掉時要大聲失敗，不要跑完整輪假裝「無符合幣對」
+    if (consecutiveFails >= MAX_CONSECUTIVE_FAILS) {
+      throw new Error(
+        `連續 ${consecutiveFails} 個標的讀不到資料，判定圖表／CDP 異常，已中止本輪掃描`
+      );
     }
 
     // 每 20 個顯示進度與 ETA
@@ -311,7 +329,9 @@ async function main() {
   console.log('\n👋 掃描器結束');
 }
 
-main().catch(err => {
+main().catch(async err => {
   console.error('\n❌ 掃描器錯誤:', err.message);
+  // 掃描器成功時會發 TG，失敗時沉默的話就無從分辨「沒符合」與「掛了」
+  await notify('極速匡掃描器錯誤', `掃描中止：${err.message}`, '❌');
   process.exit(1);
 });
