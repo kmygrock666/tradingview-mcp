@@ -10,7 +10,7 @@
  *      且收盤站上「7EMA_5MA」指標的 MA 線（MA 1）
  *   3. 最近 3 根 1H K棒收盤連續墊高（底底高）
  *
- * 極速匡移除條件（僅極速匡頁籤）：
+ * 極速匡移除條件（僅極速匡頁籤）── 目前【暫停中】，見 REMOVAL_ENABLED：
  *   3D 上漲結構被破壞 → 自清單移除並通知。
  *   往回找最後一次「紅吞」K棒（上漲趨勢的錨點），當前收盤跌破該根的
  *   最低價（含下影線）即成立。單純出現 3D 黑吞但沒收破紅吞低點不算。
@@ -61,6 +61,11 @@ const LOAD_TIMEOUT = 8000;
 // 心跳：距離上次「掃描完成」超過 間隔 + 寬限 仍沒完成，就發逾時告警。
 // 目的是讓「沒收到訊息」只剩一種解讀 —— 程式整個掛了。
 const HEARTBEAT_GRACE_MIN = 5;
+// 3D 移除檢查的總開關。false = 只做進場判斷，不從清單移除任何標的。
+// 2026-09-19 使用者要求暫停；要恢復就改回 true（或設環境變數 JSK_REMOVAL=on）。
+const REMOVAL_ENABLED = process.env.JSK_REMOVAL
+  ? process.env.JSK_REMOVAL.toLowerCase() === 'on'
+  : false;
 // 3D 移除條件往回看的 K 棒數：要夠長才找得到當作上漲錨點的那根紅吞
 const REMOVAL_BARS_3D = 12;
 // Telegram 發送逾時（ms）。Node fetch 預設不逾時，卡住會拖垮整輪。
@@ -493,7 +498,7 @@ async function runScan() {
         continue;
       }
       // 移除條件僅適用極速匡：3D 收破最後一次紅吞的最低價 → 待移除，跳過進場檢查
-      if (list === '極速匡') {
+      if (list === '極速匡' && REMOVAL_ENABLED) {
         const removal = await checkRemoval3D(tvSym);
         if (removal?.error) {
           // 移除狀態不明時不做進場判斷：寧可這輪跳過，也不要對一個
@@ -581,6 +586,7 @@ async function runScan() {
       ? `結果：${signals.length} 個進場信號（另發個別通知）`
       : '結果：無符合目標',
   ];
+  if (!REMOVAL_ENABLED) summary.push('（3D 移除檢查暫停中）');
   if (emptyLists.length) summary.push(`⚠️ 讀到 0 個標的的清單：${esc(emptyLists.join('、'))}`);
   if (removalNote) summary.push(esc(removalNote));
   if (errors.length) {
@@ -615,6 +621,7 @@ async function main() {
   console.log('║        極速匡進場監控器                  ║');
   console.log(`║  監控清單：${WATCHLISTS.join('、')}            ║`);
   console.log(`║  掃描間隔：每 ${String(INTERVAL_MIN).padEnd(2)} 分鐘                  ║`);
+  console.log(`║  移除檢查：${REMOVAL_ENABLED ? '啟用' : '【暫停中】'}                   ║`);
   console.log('╚══════════════════════════════════════════╝');
   console.log('按 Ctrl+C 停止監控\n');
 
