@@ -110,9 +110,14 @@ export async function reconnectTo(targetId) {
 async function findChartTarget() {
   const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
   const targets = await resp.json();
-  // Prefer targets with tradingview.com/chart in the URL
-  return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
-    || targets.find(t => t.type === 'page' && /tradingview/i.test(t.url))
+  // Prefer the real chart page. The error-view page that replaces a crashed
+  // renderer also lives under a path containing "TradingView", so the loose
+  // fallback used to latch onto it and every evaluate() then failed with
+  // "TradingViewApi is undefined" — exclude it explicitly.
+  const pages = targets.filter(t => t.type === 'page');
+  return pages.find(t => /tradingview\.com\/chart/i.test(t.url))
+    || pages.find(t => /^https?:/i.test(t.url) && /tradingview/i.test(t.url))
+    || pages.find(t => /tradingview/i.test(t.url) && !/error-view|crashReason/i.test(t.url))
     || null;
 }
 

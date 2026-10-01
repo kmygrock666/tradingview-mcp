@@ -18,14 +18,16 @@
  * Telegram 通知：
  *   - 進場信號：每個符合的幣對各發一則（格式未變）
  *   - 每輪摘要：不論有無符合目標，每輪掃完都發一則（時間／清單與掃描數／結果）
- *   - 錯誤：讀清單失敗、掃描例外、致命錯誤各自發通知，不靜默吞掉
+ *   - 錯誤：讀清單失敗、掃描例外、致命錯誤各自發通知，不靜默吞掉。
+ *     連線類的失敗會先自動重連一次（重挑 CDP 分頁）；救得回來就照常掃描，
+ *     救不回來才通知，並附上診斷（crash／接錯分頁／TradingView 已關閉）。
  *   - 心跳：超過 間隔 + 5 分鐘 沒完成任何一輪掃描就發逾時告警
  *   於是「完全沒收到訊息」只剩一種解讀 —— 行程整個掛了。
  *
  * 用法：node scripts/monitor-jskuang.js [間隔分鐘數，預設 30]
  */
 
-import { connect, disconnect, evaluate, evaluateAsync } from '../src/connection.js';
+import { connect, disconnect, evaluate, evaluateAsync, getTargetInfo } from '../src/connection.js';
 import { getOhlcv, getStudyValues } from '../src/core/data.js';
 import { removeFromList } from '../src/core/watchlist.js';
 
@@ -166,6 +168,58 @@ async function notify(title, message, emoji = '🚀') {
     console.log(`  ⚠️  TG 通知錯誤：${e.message}`);
     console.error('TG 通知錯誤:', e.message);
   }
+}
+
+// ─── 連線健康檢查與自動重連 ────────────────────────
+// CDP 連線活著不代表接的是圖表：TradingView 的 renderer crash 後，分頁會被
+// 換成 error-view 錯誤畫面，連線照樣通、evaluate 照樣能跑，但 TradingViewApi
+// 不存在、location.origin 變成 file://，於是每輪都卡在讀清單的 Failed to fetch。
+// 「9222 還開著」因此完全不能當作健康指標。
+async function chartHealth() {
+  let url = '', title = '';
+  try {
+    const info = await getTargetInfo();
+    url = info?.url || '';
+    title = info?.title || '';
+  } catch { /* 取不到分頁資訊就只靠下面的 API 探測 */ }
+  let ok = false;
+  try {
+    ok = await evaluate(
+      'typeof window.TradingViewApi !== "undefined" && !!window.TradingViewApi._activeChartWidgetWV'
+    ) === true;
+  } catch { ok = false; }
+  return { ok, url, title };
+}
+
+// 把「連到的是什麼」翻成人看得懂的一句話，別讓使用者對著 Failed to fetch 猜
+function diagnose({ url, title }) {
+  // Electron 內部頁的 title/url 會塞一長串 URL-encoded 參數，截掉才看得懂
+  const where = String(title || url).replace(/\?.*$/, '').slice(0, 60);
+  if (/error-view|crashReason/i.test(url)) {
+    return 'TradingView 圖表已 crash（分頁變成錯誤畫面），需要重啟 TradingView';
+  }
+  if (/^file:/i.test(url)) {
+    return `連到的不是圖表分頁而是 TradingView 的外框視窗（${where}）`;
+  }
+  if (!url) return '取不到 CDP 分頁資訊，TradingView 可能已關閉';
+  return `圖表 API 讀不到（目前分頁：${where}）`;
+}
+
+// 失敗時先重挑一次分頁再試：接錯分頁這種狀況重連就能救回來，
+// 真的是 crash 則回報明確原因，由通知講給使用者聽。
+async function tryReconnect() {
+  try {
+    await disconnect();
+  } catch { /* 舊連線已經沒了就算了 */ }
+  try {
+    await connect();
+  } catch (e) {
+    return { ok: false, note: `重新連線失敗：${e.message}` };
+  }
+  const h = await chartHealth();
+  return h.ok
+    ? { ok: true, note: `已重新連線至 ${h.url}` }
+    : { ok: false, note: diagnose(h) };
 }
 
 // ─── 圖表切換（直接 evaluate，避免 waitForChartReady 卡住）───
@@ -443,6 +497,16 @@ async function checkEntry(tvSym) {
   }
 }
 
+// 錯誤通知統一走這裡，確保「發生什麼事」和「診斷」都講出來
+async function failRound(reason, diagnosis) {
+  console.error('  ❌', reason, diagnosis ? `｜${diagnosis}` : '');
+  const lines = [`時間：${stamp()}`, esc(reason)];
+  if (diagnosis) lines.push(`診斷：${esc(diagnosis)}`);
+  lines.push(`本輪未執行，${INTERVAL_MIN} 分鐘後重試`);
+  await notify('監控器掃描錯誤', lines.join('\n'), '❌');
+  armHeartbeat();
+}
+
 // ─── 單次掃描 ────────────────────────────────────
 async function runScan() {
   console.log(`\n[${now()}] ▶ 開始掃描清單（${WATCHLISTS.join('、')}）...`);
@@ -450,14 +514,22 @@ async function runScan() {
   try {
     lists = await fetchWatchlists(WATCHLISTS);
   } catch (e) {
-    console.error('  讀取清單失敗:', e.message);
-    await notify(
-      '監控器掃描錯誤',
-      `時間：${stamp()}\n讀取監控清單失敗：${esc(e.message)}\n本輪未執行，${INTERVAL_MIN} 分鐘後重試`,
-      '❌'
-    );
-    armHeartbeat();
-    return;
+    console.warn('  ⚠️  讀取清單失敗，嘗試重新連線:', e.message);
+    const recovery = await tryReconnect();
+    if (recovery.ok) {
+      console.log(`  🔄 ${recovery.note}`);
+      try {
+        lists = await fetchWatchlists(WATCHLISTS);
+        console.log('  ✅ 重新連線後讀取成功，本輪照常掃描');
+      } catch (e2) {
+        lists = null;
+        await failRound(`讀取監控清單失敗（重連後仍失敗）：${e2.message}`, recovery.note);
+      }
+    } else {
+      lists = null;
+      await failRound(`讀取監控清單失敗：${e.message}`, recovery.note);
+    }
+    if (!lists) return;
   }
 
   // 清單讀到 0 個標的代表讀取管道壞了，不是「今天沒標的」。
@@ -589,6 +661,11 @@ async function runScan() {
   if (!REMOVAL_ENABLED) summary.push('（3D 移除檢查暫停中）');
   if (emptyLists.length) summary.push(`⚠️ 讀到 0 個標的的清單：${esc(emptyLists.join('、'))}`);
   if (removalNote) summary.push(esc(removalNote));
+  // 過半標的都失敗 → 多半不是個別標的的問題，查一下圖表還在不在
+  if (errors.length && errors.length >= Math.max(3, scanned.size / 2)) {
+    const h = await chartHealth();
+    if (!h.ok) summary.push(`診斷：${esc(diagnose(h))}`);
+  }
   if (errors.length) {
     summary.push(`錯誤：${errors.length} 個`);
     summary.push(errors.slice(0, 5).map(esc).join('\n'));
@@ -626,7 +703,15 @@ async function main() {
   console.log('按 Ctrl+C 停止監控\n');
 
   await connect();
-  console.log('✅ 已連接 TradingView CDP\n');
+  const health = await chartHealth();
+  if (!health.ok) {
+    // 啟動就接錯分頁的話，與其跑一輪全錯，不如重連一次再不行就大聲停掉
+    console.warn('⚠️  連到的分頁沒有圖表 API，嘗試重新連線...');
+    const recovery = await tryReconnect();
+    if (!recovery.ok) throw new Error(`無法連上 TradingView 圖表 — ${recovery.note}`);
+    console.log(`🔄 ${recovery.note}`);
+  }
+  console.log('✅ 已連接 TradingView CDP（圖表 API 正常）\n');
 
   // 先起心跳：第一輪就卡住也要抓得到
   armHeartbeat();
