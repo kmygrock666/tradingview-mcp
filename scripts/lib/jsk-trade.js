@@ -97,24 +97,29 @@ export function alreadyTraded(symbol, barTime) {
 }
 
 /**
- * 依計畫下兩張單（各半部位，5R 與 10R）。
- * 兩張都失敗才算整體失敗；只成功一張也照實記錄，不假裝順利。
+ * 下一張限價單，帶兩個「出場水平」（各半部位，5R 與 10R）。
+ *
+ * 不能改用兩張各半的 bracket 單：同商品的兩張單成交後會被併成一個部位，
+ * 兩個停利在合併時會消失，只剩一個涵蓋全部數量的停損 —— 分批停利等於沒做
+ * （2026-10-16 實測 ETH：0.559 的部位只剩 SL）。
  */
 export async function placeSignalOrders({ symbol, plan, barTime, dryRun = false }) {
-  const results = [];
-  for (const t of plan.targets) {
-    const r = await placeLimitBracket({
-      symbol,
-      qty: plan.qtyEach,
-      limitPrice: plan.entry,
-      stopPrice: plan.stop,
-      tpPrice: t.price,
-      dryRun,
-    });
-    results.push({ leg: `${t.multiple}R`, tp: t.price, ok: !!r.ok, step: r.step || null,
-                   detail: r.detail || null, preview: r.preview || null });
-    if (!r.ok) await closeTicket();   // 失敗就把視窗收掉，別卡住下一張
-  }
+  const exits = plan.targets.map(t => ({ qty: plan.qtyEach, tp: t.price }));
+  const r = await placeLimitBracket({
+    symbol,
+    qty: plan.qtyTotal,          // 一張單下總量，再由出場水平拆成兩半
+    limitPrice: plan.entry,
+    stopPrice: plan.stop,
+    tpPrice: exits[0].tp,        // 水平1 會繼承這個值
+    exits,
+    dryRun,
+  });
+  const results = plan.targets.map((t, i) => ({
+    leg: `${t.multiple}R`, tp: t.price, qty: plan.qtyEach,
+    ok: !!r.ok, step: r.step || null, detail: r.detail || null,
+    preview: i === 0 ? (r.preview || null) : null,
+  }));
+  if (!r.ok) await closeTicket();   // 失敗就把視窗收掉，別卡住下一次
 
   // 回填訂單編號，之後過期取消要靠它對帳
   let orderIds = [];
