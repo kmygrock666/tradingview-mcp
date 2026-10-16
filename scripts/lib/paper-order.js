@@ -518,6 +518,55 @@ export async function fixPositionExits({ symbol, tp1, tp2, stopPrice }) {
   })()`);
 }
 
+/** 目前持倉（商品、方向、數量、均價） */
+export async function listPositions() {
+  return evaluateAsync(`(async function(){
+    ${PAGE_HELPERS}
+    var tab = Array.prototype.slice.call(document.querySelectorAll('button')).filter(function(b){
+      return b.offsetParent !== null && (b.textContent||'').trim().indexOf('持倉') === 0;
+    })[0];
+    if (!tab) return { ok: false, reason: '找不到持倉分頁（交易面板沒開？）' };
+    tab.click();
+    await sleep(700);
+    var els = Array.prototype.slice.call(document.querySelectorAll('div, tr')).filter(function(e){
+      var t = e.innerText || '';
+      return e.offsetParent !== null && t.length < 400 && t.indexOf(':') >= 0
+        && (t.indexOf('做多') >= 0 || t.indexOf('做空') >= 0)
+        && e.querySelector('[data-name="edit-settings-cell-button"]');
+    });
+    var rows = els.filter(function(e){ return !els.some(function(o){ return o !== e && e.contains(o); }); });
+    return { ok: true, rows: rows.map(function(e){
+      var cells = (e.innerText || '').split(String.fromCharCode(10)).join(String.fromCharCode(9))
+        .split(String.fromCharCode(9)).map(function(s){ return s.trim(); }).filter(Boolean);
+      return {
+        symbol: cells.filter(function(c){ return c.indexOf(':') >= 0; })[0] || null,
+        side: cells.filter(function(c){ return c === '做多' || c === '做空'; })[0] || null,
+        cells: cells.slice(0, 8)
+      };
+    }) };
+  })()`);
+}
+
+/**
+ * 目前「真的還開著」的商品：有掛單或有持倉的。
+ *
+ * 防重複下單必須看這個，不能看帳本 —— 帳本記的是「當時下了單」，它永遠
+ * 不會知道那筆單後來成交、停損、被取消了。2026-10-16 BTW 就是這樣：單子
+ * 早在 18:52 停損出場，帳本仍寫著 placed，於是之後的新信號全被擋掉。
+ */
+export async function openExposure() {
+  const [orders, positions] = await Promise.all([listOrders(), listPositions()]);
+  const symbols = new Set();
+  (orders.rows || []).forEach(r => { if (r.symbol && r.type) symbols.add(r.symbol); });
+  (positions.rows || []).forEach(r => { if (r.symbol) symbols.add(r.symbol); });
+  return {
+    ok: (orders.ok !== false) && (positions.ok !== false),
+    symbols: [...symbols],
+    orderCount: orders.count || 0,
+    positionCount: (positions.rows || []).length,
+  };
+}
+
 /** 關閉訂單視窗（不送出） */
 export async function closeTicket() {
   return evaluateAsync(`(async function(){

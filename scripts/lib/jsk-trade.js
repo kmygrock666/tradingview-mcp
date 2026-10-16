@@ -13,7 +13,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicket } from './paper-order.js';
+import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicket, openExposure } from './paper-order.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const JOURNAL = path.join(ROOT, 'trades-jskuang.jsonl');
@@ -193,13 +193,17 @@ export async function tradeSignal({ symbol, prevBar, barTime, dryRun = false }) 
 
   // 同一個幣在不同交易所會被當成兩個標的（OKX:SOLUSDT.P 與 BINANCE:SOLUSDT.P），
   // 各下一次就等於同一個幣押了兩倍風險。以「幣名」為準擋掉重複。
+  //
+  // 判斷依據一定要是帳戶的實際掛單與持倉，不能用帳本：帳本記的是「當時下了
+  // 單」，不會知道那筆後來成交、停損或被取消。2026-10-16 BTW 就是這樣 ——
+  // 17:12 進場、18:52 停損出場，帳本仍寫著 placed，於是 9 小時內的新信號
+  // 全被擋掉，白白錯過重新進場的機會。
   const base = baseAsset(symbol);
-  const openSame = readJournal().filter(e =>
-    e.status === 'placed' && !e.dryRun && baseAsset(e.symbol) === base
-    && Date.now() - new Date(e.ts).getTime() < ORDER_TTL_MS);
-  if (openSame.length) {
-    return { skipped: true,
-             reason: `${base} 已有未結的單（${openSame[0].symbol.split(':')[0]}），不重複下` };
+  const live = await openExposure();
+  if (!live.ok) return { ok: false, reason: '讀不到目前的掛單／持倉，為保險起見不下單' };
+  const clash = live.symbols.find(s => baseAsset(s) === base);
+  if (clash) {
+    return { skipped: true, reason: `${base} 目前仍有未結部位或掛單（${clash}），不重複下` };
   }
 
   const plan = computePlan({ prevBar, equity: acct.equity, available: acct.available });
