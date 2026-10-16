@@ -138,6 +138,33 @@ const PAGE_EXIT_LEVELS = `
     });
     return true;
   }
+  // 面板上的價格有兩種樣貌：收合層寫在文字裡（2,631.62 帶逗號），展開層在
+  // input 裡且補到商品精度（0.1598 → 0.15980）。字串比對兩邊都會失手，
+  // 所以一律抓出所有數字再用數值比對。
+  function panelNumbers() {
+    var pnl = levelsPanel();
+    if (!pnl) return [];
+    var nums = [];
+    panelLines().join(' ').split(',').join('').split(' ').forEach(function(tok){
+      var n = parseFloat(tok);
+      if (isFinite(n)) nums.push(n);
+    });
+    Array.prototype.slice.call(pnl.querySelectorAll('input')).forEach(function(i){
+      if (i.type === 'checkbox') return;
+      var n = parseFloat(String(i.value).split(',').join(''));
+      if (isFinite(n)) nums.push(n);
+    });
+    return nums;
+  }
+  function levelShown(v) {
+    var target = parseFloat(v);
+    if (!isFinite(target)) return false;
+    var tol = Math.max(1e-9, Math.abs(target) * 1e-6);
+    return panelNumbers().some(function(n){ return Math.abs(n - target) <= tol; });
+  }
+  function panelDigest() {
+    return panelLines().join(' ').slice(0, 160);
+  }
   function clickLevelsConfirm() {
     var pnl = levelsPanel();
     if (!pnl) return false;
@@ -358,18 +385,11 @@ export async function placeLimitBracket({ symbol, qty, limitPrice, stopPrice, tp
       // 兩層加起來必須剛好蓋住整個部位，少了等於有一半沒出場計畫
       var pct = protectionPct();
       if (!(Math.abs(pct - 100) < 1)) return fail('levels', '保護倉位大小是 ' + pct + '%，不是 100%');
-      // 收合的水平把價格寫在文字裡（還帶千分位逗號），展開中的那層在 input 裡，
-      // 只查文字會把正確的單誤判成失敗（2026-10-16 DUSK 就是這樣被擋掉的）
-      var joined = panelLines().join(' ').split(',').join('');
-      var liveVals = Array.prototype.slice.call(levelsPanel().querySelectorAll('input'))
-        .filter(function(i){ return i.type !== 'checkbox'; })
-        .map(function(i){ return String(i.value).split(',').join(''); });
-      function levelShown(v) {
-        return joined.indexOf(String(v)) >= 0 || liveVals.indexOf(String(v)) >= 0;
-      }
-      if (!levelShown(e1.tp) || !levelShown(e2.tp)) {
-        return fail('levels', '面板裡看不到兩個停利價（' + e1.tp + ' / ' + e2.tp + '）：' + joined.slice(0, 160));
-      }
+      // 收合的水平把價格寫在文字裡（帶千分位逗號），展開中的那層在 input 裡，
+      // 而且會被補成該商品的價格精度（0.1598 → 0.15980）。字串比對兩種格式
+      // 都會踩雷，一律改成「抓出所有數字，用數值比」。
+      if (!levelShown(e1.tp)) return fail('levels', '面板裡看不到第一批停利 ' + e1.tp + '：' + panelDigest());
+      if (!levelShown(e2.tp)) return fail('levels', '面板裡看不到第二批停利 ' + e2.tp + '：' + panelDigest());
       log.push('保護倉位大小 ' + pct + '%');
       if (!clickLevelsConfirm()) return fail('levels', '找不到水平面板的「確認」');
       await sleep(1000);
@@ -484,17 +504,8 @@ export async function fixPositionExits({ symbol, tp1, tp2, stopPrice }) {
 
     var pct = protectionPct();
     if (!(Math.abs(pct - 100) < 1.5)) return fail('levels', '保護倉位大小 ' + pct + '%，不是 100%');
-    // 收合的水平把價格寫在文字裡（帶千分位逗號），展開中的那層則是在 input 裡，
-    // 只看其中一邊一定會漏，兩邊都要查。
-    var joined = panelLines().join(' ').split(',').join('');
-    var liveInputs = Array.prototype.slice.call(levelsPanel().querySelectorAll('input'))
-      .filter(function(i){ return i.type !== 'checkbox'; })
-      .map(function(i){ return String(i.value).split(',').join(''); });
-    function shown(v) {
-      return joined.indexOf(String(v)) >= 0 || liveInputs.indexOf(String(v)) >= 0;
-    }
-    if (!shown(p.tp1)) return fail('levels', '面板看不到第一批停利 ' + p.tp1);
-    if (!shown(p.tp2)) return fail('levels', '面板看不到第二批停利 ' + p.tp2);
+    if (!levelShown(p.tp1)) return fail('levels', '面板看不到第一批停利 ' + p.tp1 + '：' + panelDigest());
+    if (!levelShown(p.tp2)) return fail('levels', '面板看不到第二批停利 ' + p.tp2 + '：' + panelDigest());
     log.push('保護倉位大小 ' + pct + '%');
 
     if (!clickLevelsConfirm()) return fail('levels', '找不到水平面板的確認');
