@@ -15,6 +15,12 @@
  *   往回找最後一次「紅吞」K棒（上漲趨勢的錨點），當前收盤跌破該根的
  *   最低價（含下影線）即成立。單純出現 3D 黑吞但沒收破紅吞低點不算。
  *
+ * 自動下單（模擬交易「極速匡帳戶」，見 TRADING_ENABLED）：
+ *   抓到進場信號就掛限價單等回踩 —— 進場＝3H紅吞「前一根」的最高價，
+ *   停損＝該根最低價，R＝兩者之差，停利分 5R 與 10R 兩批各半部位，
+ *   單筆風險＝權益 2%。9 小時（3 根 3H K 棒）沒成交就撤單。
+ *   每筆都寫進 trades-jskuang.jsonl，同一根 K 棒不會重複下單。
+ *
  * Telegram 通知：
  *   - 進場信號：每個符合的幣對各發一則（格式未變）
  *   - 每輪摘要：不論有無符合目標，每輪掃完都發一則（時間／清單與掃描數／結果）
@@ -30,6 +36,7 @@
 import { connect, disconnect, evaluate, evaluateAsync, getTargetInfo } from '../src/connection.js';
 import { getOhlcv, getStudyValues } from '../src/core/data.js';
 import { removeFromList } from '../src/core/watchlist.js';
+import { tradeSignal, expireStaleOrders, ORDER_TTL_MS } from './lib/jsk-trade.js';
 
 // 自動載入專案根目錄的 .env(已用 export 設定或檔案不存在時略過)
 try { process.loadEnvFile(new URL('../.env', import.meta.url)); } catch {}
@@ -60,6 +67,11 @@ const TF_WAIT = 100;
 // 等待圖表載入資料的輪詢間隔與逾時（ms）
 const POLL_INTERVAL = 200;
 const LOAD_TIMEOUT = 8000;
+// 指標值的等待逾時（ms）。原本 3 秒太緊：一輪要切換 39 個標的 × 3~4 個週期，
+// 圖表持續重載，而每次輪詢的 getStudyValues 會走訪圖表上全部指標，負載下
+// 單次就要好幾百毫秒 —— 3 秒只夠輪詢五到八次，慢的標的（新上市、資料沒快取）
+// 來不及算完就被判成失敗，白白漏掉已經通過 1D 與 3H 條件的候選標的。
+const MA_TIMEOUT_MS = 8000;
 // 心跳：距離上次「掃描完成」超過 間隔 + 寬限 仍沒完成，就發逾時告警。
 // 目的是讓「沒收到訊息」只剩一種解讀 —— 程式整個掛了。
 const HEARTBEAT_GRACE_MIN = 5;
@@ -72,6 +84,12 @@ const REMOVAL_ENABLED = process.env.JSK_REMOVAL
 const REMOVAL_BARS_3D = 12;
 // Telegram 發送逾時（ms）。Node fetch 預設不逾時，卡住會拖垮整輪。
 const TG_TIMEOUT_MS = 10000;
+// 自動下單總開關（模擬交易「極速匡帳戶」）。關掉就只發信號不下單。
+// 2026-10-16 起啟用：抓到信號就掛限價單，進場＝3H紅吞前一根的高點，
+// 停損＝該根低點，停利分 5R 與 10R 兩批，單筆風險 2% 權益。
+const TRADING_ENABLED = process.env.JSK_TRADING
+  ? process.env.JSK_TRADING.toLowerCase() === 'on'
+  : true;
 
 // 已通知記錄：避免同一根 K 棒重複通知（key = symbol+barTime）
 const notified = new Set();
@@ -280,10 +298,34 @@ async function waitForChart(symbol, tf, minBars, count, timeoutMs = LOAD_TIMEOUT
   );
 }
 
+// 指標在不在圖表上 —— 只看 dataSources 的名稱，不管算出值了沒。
+// getStudyValues 會把「資料視窗全是 ∅」的指標整個濾掉（data.js 的
+// `if (Object.keys(values).length > 0)`），所以單靠它分不出「指標被移除了」
+// 和「指標還在重算」，兩者都長成「找不到指標」。查不到清單時回 null。
+async function studyOnChart(nameSubstr) {
+  try {
+    const names = await evaluate(`(function() {
+      var sources = ${CHART_API}._chartWidget.model().model().dataSources();
+      var out = [];
+      for (var i = 0; i < sources.length; i++) {
+        try {
+          var m = sources[i].metaInfo && sources[i].metaInfo();
+          if (m) out.push(m.description || m.shortDescription || '');
+        } catch (e) {}
+      }
+      return out.filter(Boolean);
+    })()`);
+    if (!Array.isArray(names)) return null;
+    return names.some(n => n.includes(nameSubstr));
+  } catch {
+    return null;
+  }
+}
+
 // 指標值是在序列載入後才重算的，切換完當下常常還讀不到。
 // 讀不到就當「條件不成立」會靜靜漏掉進場信號 —— 改成輪詢等，
 // 真的等不到就丟錯，由每輪摘要回報，不當作已判斷過。
-async function waitForMaValue(timeoutMs = 3000) {
+async function waitForMaValue(timeoutMs = MA_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const sv = await getStudyValues();
@@ -291,11 +333,19 @@ async function waitForMaValue(timeoutMs = 3000) {
     const val = parseStudyNum(study?.values?.[MA_VALUE_KEY]);
     if (Number.isFinite(val)) return val;
     if (Date.now() >= deadline) {
-      throw new Error(
-        study
-          ? `「${MA_STUDY_NAME}」的 ${MA_VALUE_KEY} 讀不到數值`
-          : `圖表上找不到「${MA_STUDY_NAME}」指標（需保持可見）`
-      );
+      // 讀不到值不等於指標不在：另外查一次名稱清單才講得出是哪一種，
+      // 否則訊息會叫人去檢查一個明明就開著的指標。
+      const onChart = await studyOnChart(MA_STUDY_NAME);
+      const secs = Math.round(timeoutMs / 1000);
+      if (onChart === true) {
+        throw new Error(
+          `「${MA_STUDY_NAME}」在圖表上，但 ${secs} 秒內沒算出 ${MA_VALUE_KEY}（指標重算較慢，下輪重試）`
+        );
+      }
+      if (onChart === false) {
+        throw new Error(`圖表上找不到「${MA_STUDY_NAME}」指標（需保持可見）`);
+      }
+      throw new Error(`讀不到「${MA_STUDY_NAME}」的 ${MA_VALUE_KEY}，且查不到圖表的指標清單`);
     }
     await sleep(POLL_INTERVAL);
   }
@@ -490,7 +540,9 @@ async function checkEntry(tvSym) {
       b[b.length - 2].close < b[b.length - 1].close;
     if (!h1_higher) return null;
 
-    return { symbol: tvSym, displayName, price: curr3h.close, barTime: curr3h.time, d1Signal };
+    // prevBar 就是下單依據：進場＝它的高點，停損＝它的低點
+    return { symbol: tvSym, displayName, price: curr3h.close, barTime: curr3h.time, d1Signal,
+             prevBar: { high: prev3h.high, low: prev3h.low, time: prev3h.time } };
   } catch (e) {
     // 單一幣對失敗不中斷整輪，但要記下來讓本輪摘要看得到，不靜默吞掉
     return { error: e.message || String(e) };
@@ -597,8 +649,29 @@ async function runScan() {
         const key = `${tvSym}-${result.barTime}`;
         if (!notified.has(key)) {
           notified.add(key);
-          signals.push({ ...result, list });
           console.log('🔔 進場信號！');
+          // 下單要在這裡做：圖表現在還停在這個標的上，
+          // 迴圈一往下走就會被切到下一個，訂單視窗會跟著換商品。
+          let trade = null;
+          if (TRADING_ENABLED && result.prevBar) {
+            try {
+              trade = await tradeSignal({
+                symbol: tvSym, prevBar: result.prevBar, barTime: result.barTime,
+              });
+              if (trade.skipped) {
+                console.log(`  ⏭ 不下單：${trade.reason}`);
+              } else if (trade.ok) {
+                const p2 = trade.plan;
+                console.log(`  💰 已下單：進場 ${p2.entry} 停損 ${p2.stop} 數量 ${p2.qtyEach}×2 風險 ${p2.actualRiskUSD} USD`);
+              } else {
+                console.warn(`  ⚠️  下單失敗：${trade.reason || trade.entry?.orders?.map(o => o.step + ':' + o.detail).join('；')}`);
+              }
+            } catch (e) {
+              trade = { ok: false, reason: e.message };
+              console.error('  ⚠️  下單例外:', e.message);
+            }
+          }
+          signals.push({ ...result, list, trade });
         } else {
           console.log('✅ (已通知)');
         }
@@ -639,14 +712,47 @@ async function runScan() {
 
   if (signals.length > 0) {
     for (const s of signals) {
-      await notify(
-        `${s.list}進場信號`,
-        `${s.displayName}  @${s.price}\n1D${s.d1Signal} + 3H黑吞轉紅吞站上MA + 1H底底高`
-      );
+      const lines = [
+        `${s.displayName}  @${s.price}`,
+        `1D${s.d1Signal} + 3H黑吞轉紅吞站上MA + 1H底底高`,
+      ];
+      if (s.trade?.ok) {
+        const p3 = s.trade.plan;
+        lines.push(
+          `進場 ${p3.entry}（限價等回踩，${Math.round(ORDER_TTL_MS / 3600000)}h 未成交取消）`,
+          `停損 ${p3.stop}　R=${p3.R.toFixed(6)}`,
+          `停利 ${p3.targets.map(t => `${t.multiple}R→${t.price}`).join('　')}`,
+          `數量 ${p3.qtyEach} × 2 批　風險 ${p3.actualRiskUSD} USD（權益 ${p3.equity}）`
+        );
+        if (p3.capped) lines.push('⚠️ 數量受可用保證金上限壓縮');
+      } else if (s.trade?.skipped) {
+        lines.push(`（未下單：${esc(s.trade.reason)}）`);
+      } else if (s.trade) {
+        lines.push(`⚠️ 下單失敗：${esc(s.trade.reason || '見 log')}`);
+      } else if (!TRADING_ENABLED) {
+        lines.push('（自動下單已關閉）');
+      }
+      await notify(`${s.list}進場信號`, lines.join('\n'));
     }
     console.log(`\n  🔔 通知已發送：${signals.map(s => s.displayName).join(', ')}`);
   } else {
     console.log(`  無進場信號`);
+  }
+
+  // 掛超過 9 小時（3 根 3H K 棒）還沒成交的限價單要撤掉，
+  // 否則信號早就失效了單還掛在那裡等。
+  let expiredNote = null;
+  if (TRADING_ENABLED) {
+    try {
+      const exp = await expireStaleOrders();
+      if (exp.expired.length) {
+        expiredNote = `已撤銷逾期掛單：${exp.expired.map(e => e.symbol.split(':').pop()).join('、')}`;
+        console.log(`  ⌛ ${expiredNote}`);
+      }
+    } catch (e) {
+      expiredNote = `逾期掛單檢查失敗：${e.message}`;
+      console.error('  ⚠️ ', expiredNote);
+    }
   }
 
   // 每輪都回報一次，讓「沒收到訊息」只剩「監控器掛了」一種解讀
@@ -659,6 +765,8 @@ async function runScan() {
       : '結果：無符合目標',
   ];
   if (!REMOVAL_ENABLED) summary.push('（3D 移除檢查暫停中）');
+  if (!TRADING_ENABLED) summary.push('（自動下單已關閉）');
+  if (expiredNote) summary.push(esc(expiredNote));
   if (emptyLists.length) summary.push(`⚠️ 讀到 0 個標的的清單：${esc(emptyLists.join('、'))}`);
   if (removalNote) summary.push(esc(removalNote));
   // 過半標的都失敗 → 多半不是個別標的的問題，查一下圖表還在不在
@@ -699,6 +807,7 @@ async function main() {
   console.log(`║  監控清單：${WATCHLISTS.join('、')}            ║`);
   console.log(`║  掃描間隔：每 ${String(INTERVAL_MIN).padEnd(2)} 分鐘                  ║`);
   console.log(`║  移除檢查：${REMOVAL_ENABLED ? '啟用' : '【暫停中】'}                   ║`);
+  console.log(`║  自動下單：${TRADING_ENABLED ? '啟用（模擬帳戶）' : '關閉'}            ║`);
   console.log('╚══════════════════════════════════════════╝');
   console.log('按 Ctrl+C 停止監控\n');
 
