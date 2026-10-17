@@ -355,11 +355,16 @@ export async function placeLimitBracket({ symbol, qty, limitPrice, stopPrice, tp
     // 停利／停損的輸入模式預設不一定是「價格」：停損預設是「%餘額」，直接
     // 填 0.14 會被當成「賠 0.14% 權益」換算成 0.1493 的停損價 —— 畫面看起來
     // 完全正常，單子卻是錯的。所以切換後一定要回讀確認。
+    // 不要用「停利, 」這種帶逗號的樣式去認按鈕：TradingView 改版後逗號就不見了
+    // （2026-10-17 重啟後從「停利, 價格」變成「停利 價格」，整條下單路徑因此
+    // 全面失效）。改用結構性特徵：分頁的文字正好等於「停損」，模式鈕則是
+    // 「停損」後面還接著模式名稱。
     function exitModeBtn(prefix) {
       var tk = ticket();
       var b = Array.prototype.slice.call(tk.querySelectorAll('button')).filter(function(x){
-        return x.getAttribute('role') !== 'tab'
-          && new RegExp('^' + prefix + '\\\\s*,').test((x.textContent || '').trim());
+        if (x.getAttribute('role') === 'tab') return false;
+        var s = (x.textContent || '').trim();
+        return s.indexOf(prefix) === 0 && s.length > prefix.length && s.length <= 14;
       })[0];
       return b ? { btn: b, text: (b.textContent || '').trim() } : null;
     }
