@@ -13,7 +13,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicket, openExposure } from './paper-order.js';
+import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicket, openExposure, ensureTradingPanel } from './paper-order.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const JOURNAL = path.join(ROOT, 'trades-jskuang.jsonl');
@@ -180,6 +180,10 @@ export async function tradeSignal({ symbol, prevBar, barTime, dryRun = false }) 
   if (alreadyTraded(symbol, barTime)) {
     return { skipped: true, reason: '這根 K 棒已經下過單' };
   }
+  // TradingView 重啟後交易面板不會自動展開，而帳戶與掛單都只能從那裡讀
+  const panel = await ensureTradingPanel();
+  if (!panel.ok) return { ok: false, reason: `交易面板開不起來（${panel.action}）` };
+
   const acct = await accountSummary();
   if (!acct.ok) return { ok: false, reason: `讀不到帳戶：${acct.reason}` };
 

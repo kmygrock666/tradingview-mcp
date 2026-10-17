@@ -176,6 +176,58 @@ const PAGE_EXIT_LEVELS = `
   }
 `;
 
+/**
+ * 確保底部的模擬交易面板是開著且展開的。
+ *
+ * TradingView 重啟後面板不會自動展開，而帳戶、掛單、持倉全都只能從那裡讀 ——
+ * 不先確保它開著，監控器會每筆都卡在「讀不到帳戶」。收合狀態用
+ * toggle-maximize-button 展開；完全沒接經紀商時才需要走「交易 → Paper Trading」。
+ */
+export async function ensureTradingPanel() {
+  return evaluateAsync(`(async function(){
+    ${PAGE_HELPERS}
+    function hasAccountTabs() {
+      return Array.prototype.slice.call(document.querySelectorAll('button')).some(function(b){
+        return b.offsetParent !== null && (b.textContent || '').trim().indexOf('持倉') === 0;
+      });
+    }
+    if (hasAccountTabs()) return { ok: true, action: 'already-open' };
+
+    var steps = [];
+    // 1) 面板只是被收合
+    for (var i = 0; i < 2 && !hasAccountTabs(); i++) {
+      var btn = document.querySelector('[data-name="toggle-maximize-button"]');
+      if (!btn) break;
+      btn.click();
+      steps.push('展開面板');
+      await sleep(1800);
+    }
+    if (hasAccountTabs()) return { ok: true, action: steps.join('→') };
+
+    // 2) 面板整個沒開：點頂部的「交易」
+    var trade = Array.prototype.slice.call(document.querySelectorAll('button, [role="button"]')).filter(function(b){
+      return b.offsetParent !== null && (b.textContent || '').trim() === '交易';
+    })[0];
+    if (trade) { trade.click(); steps.push('點交易'); await sleep(2500); }
+    if (hasAccountTabs()) return { ok: true, action: steps.join('→') };
+
+    // 3) 跳出經紀商選單時選 Paper Trading
+    var card = Array.prototype.slice.call(document.querySelectorAll('div')).filter(function(e){
+      return e.offsetParent !== null && /Paper Trading/i.test(e.textContent || '') && (e.textContent || '').length < 60;
+    })[0];
+    if (card) {
+      var r = card.getBoundingClientRect();
+      ['mousedown','mouseup','click'].forEach(function(k){
+        card.dispatchEvent(new MouseEvent(k, { bubbles:true, cancelable:true, view:window,
+          clientX: r.left + r.width/2, clientY: r.top + r.height/2 }));
+      });
+      steps.push('選 Paper Trading');
+      await sleep(3000);
+    }
+    return { ok: hasAccountTabs(), action: steps.join('→') || '沒有可用的開啟方式' };
+  })()`);
+}
+
 /** 圖表目前的商品 */
 export async function currentSymbol() {
   return evaluate(`(function(){ try { return ${CHART_API}.symbol(); } catch(e) { return null; } })()`);
@@ -566,7 +618,11 @@ export async function listPositions() {
  * 早在 18:52 停損出場，帳本仍寫著 placed，於是之後的新信號全被擋掉。
  */
 export async function openExposure() {
-  const [orders, positions] = await Promise.all([listOrders(), listPositions()]);
+  // 一定要循序：listOrders 會點「訂單」分頁、listPositions 會點「持倉」分頁，
+  // 兩者共用同一個畫面。用 Promise.all 併發的話誰後點誰贏，另一個會讀到空的，
+  // 未結清單就會缺一半 —— 2026-10-17 WIF/PHA/ZAMA 被重複下單就是這樣來的。
+  const orders = await listOrders();
+  const positions = await listPositions();
   const symbols = new Set();
   (orders.rows || []).forEach(r => { if (r.symbol && r.type) symbols.add(r.symbol); });
   (positions.rows || []).forEach(r => { if (r.symbol) symbols.add(r.symbol); });
@@ -659,8 +715,8 @@ export async function listOrders() {
  * 取消進場單時，TradingView 通常會連帶清掉它的停利/停損子單，所以會重複掃描
  * 直到沒有符合的列為止（最多 10 輪，避免 UI 卡住時無限迴圈）。
  */
-export async function cancelOrders({ symbol = null } = {}) {
-  const payload = JSON.stringify({ symbol });
+export async function cancelOrders({ symbol = null, orderIds = null } = {}) {
+  const payload = JSON.stringify({ symbol, orderIds });
   return evaluateAsync(`(async function(){
     ${PAGE_HELPERS}
     ${PAGE_ORDER_ROWS}
@@ -674,7 +730,14 @@ export async function cancelOrders({ symbol = null } = {}) {
     var cancelled = [], notes = [];
     for (var round = 0; round < 10; round++) {
       var rows = orderRows().filter(function(e){
-        return !bare || (e.innerText || '').indexOf(bare) >= 0;
+        var txt = e.innerText || '';
+        if (bare && txt.indexOf(bare) < 0) return false;
+        // 指定 orderIds 時只動這幾張：同一個商品可能同時有該保留的部位出場單
+        // 和該取消的掛單，整批砍會把部位的停損一起砍掉。
+        if (p.orderIds && p.orderIds.length) {
+          return p.orderIds.some(function(id){ return txt.indexOf(String(id)) >= 0; });
+        }
+        return true;
       });
       if (!rows.length) break;
       var row = rows[0];
