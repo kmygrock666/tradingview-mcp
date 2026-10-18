@@ -6,7 +6,7 @@
  *   停損價 = 紅吞「前一根」的最低價
  *   R      = 進場價 − 停損價
  *   停利   = 進場 + 5R 與 進場 + 10R 兩批，各半部位
- *   單筆風險 = 權益 × 2%
+ *   單筆風險 = 權益 × 2%（總資金虧損 >20% 時降為 0.5%）
  *   限價單 9 小時（3 根 3H K 棒）內沒成交就取消
  */
 
@@ -24,6 +24,21 @@ export const ORDER_TTL_MS = 9 * 3600 * 1000;  // 限價單有效期：3 根 3H K
 const LEVERAGE = 10;                   // 帳戶顯示 10x；用來估保證金夠不夠
 const MARGIN_USE_CAP = 0.4;            // 單一信號最多動用 40% 可用資金
 const MIN_AVAILABLE_PCT = 0.25;        // 可用資金低於權益的 25% 就不再開新倉
+
+// ── 回撤降風險（使用者 2026-10-18 要求）──────────────────
+// 總資金虧損超過 20% 就把單筆風險從 2% 調降到 0.5%，讓策略在逆風時
+// 自動縮小部位，不必等人介入。基準是「實驗起始權益」，不是歷史最高點 ——
+// 照字面的「總資金虧損」解釋；要改成以最高點計算把 INITIAL_EQUITY 換掉即可。
+export const INITIAL_EQUITY = 973.75;      // 2026-10-16 15:47 開始實驗時的權益
+export const DRAWDOWN_TRIGGER = 0.20;      // 虧損超過 20%
+export const RISK_PCT_REDUCED = 0.005;     // 觸發後的單筆風險
+
+/** 依目前權益決定要用哪一檔風險 */
+export function riskProfile(equity) {
+  const drawdown = (INITIAL_EQUITY - equity) / INITIAL_EQUITY;
+  const reduced = drawdown > DRAWDOWN_TRIGGER;
+  return { pct: reduced ? RISK_PCT_REDUCED : RISK_PCT, drawdown, reduced };
+}
 
 /** OKX:SOLUSDT.P / BINANCE:SOLUSDT.P → SOL（判斷是不是同一個幣） */
 export function baseAsset(symbol) {
@@ -55,7 +70,8 @@ export function computePlan({ prevBar, equity, available }) {
   const R = entry - stop;
   if (!(R > 0)) return { ok: false, reason: `R 不是正數（高 ${entry} 低 ${stop}）` };
 
-  const riskUSD = +(equity * RISK_PCT).toFixed(2);
+  const risk = riskProfile(equity);
+  const riskUSD = +(equity * risk.pct).toFixed(2);
   let qtyTotal = riskUSD / R;
 
   // 保證金夠不夠：名目 = 數量 × 進場價，保證金 ≈ 名目 / 槓桿
@@ -74,6 +90,7 @@ export function computePlan({ prevBar, equity, available }) {
     targets: TP_MULTIPLES.map(m => ({ multiple: m, price: roundPrice(entry + m * R, entry) })),
     qtyEach, qtyTotal: roundQty(qtyEach * TP_MULTIPLES.length),
     riskUSD, equity, capped,
+    riskPct: risk.pct, drawdown: risk.drawdown, riskReduced: risk.reduced,
     // 實際風險：數量被保證金上限砍過的話會小於名目風險
     actualRiskUSD: +(roundQty(qtyEach * TP_MULTIPLES.length) * R).toFixed(2),
   };
@@ -135,6 +152,7 @@ export async function placeSignalOrders({ symbol, plan, barTime, dryRun = false 
     entry: plan.entry, stop: plan.stop, R: plan.R,
     targets: plan.targets, qtyEach: plan.qtyEach, qtyTotal: plan.qtyTotal,
     riskUSD: plan.riskUSD, actualRiskUSD: plan.actualRiskUSD, equity: plan.equity,
+    riskPct: plan.riskPct, drawdown: plan.drawdown, riskReduced: plan.riskReduced,
     capped: plan.capped, dryRun,
     orders: results, orderIds,
     status: results.some(r => r.ok) ? 'placed' : 'failed',

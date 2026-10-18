@@ -18,7 +18,8 @@
  * 自動下單（模擬交易「極速匡帳戶」，見 TRADING_ENABLED）：
  *   抓到進場信號就掛限價單等回踩 —— 進場＝3H紅吞「前一根」的最高價，
  *   停損＝該根最低價，R＝兩者之差，停利分 5R 與 10R 兩批各半部位，
- *   單筆風險＝權益 2%。9 小時（3 根 3H K 棒）沒成交就撤單。
+ *   單筆風險＝權益 2%；總資金虧損超過 20% 時自動降為 0.5%。
+ *   9 小時（3 根 3H K 棒）沒成交就撤單。
  *   每筆都寫進 trades-jskuang.jsonl，同一根 K 棒不會重複下單。
  *
  * Telegram 通知：
@@ -36,7 +37,7 @@
 import { connect, disconnect, evaluate, evaluateAsync, getTargetInfo } from '../src/connection.js';
 import { getOhlcv, getStudyValues } from '../src/core/data.js';
 import { removeFromList } from '../src/core/watchlist.js';
-import { tradeSignal, expireStaleOrders, ORDER_TTL_MS } from './lib/jsk-trade.js';
+import { tradeSignal, expireStaleOrders, ORDER_TTL_MS, DRAWDOWN_TRIGGER, RISK_PCT_REDUCED } from './lib/jsk-trade.js';
 
 // 自動載入專案根目錄的 .env(已用 export 設定或檔案不存在時略過)
 try { process.loadEnvFile(new URL('../.env', import.meta.url)); } catch {}
@@ -662,7 +663,9 @@ async function runScan() {
                 console.log(`  ⏭ 不下單：${trade.reason}`);
               } else if (trade.ok) {
                 const p2 = trade.plan;
-                console.log(`  💰 已下單：進場 ${p2.entry} 停損 ${p2.stop} 數量 ${p2.qtyEach}×2 風險 ${p2.actualRiskUSD} USD`);
+                console.log(`  💰 已下單：進場 ${p2.entry} 停損 ${p2.stop} 數量 ${p2.qtyEach}×2 ` +
+                  `風險 ${p2.actualRiskUSD} USD（${(p2.riskPct * 100).toFixed(2)}%` +
+                  `${p2.riskReduced ? `，回撤 ${(p2.drawdown * 100).toFixed(1)}% 已降風險` : ''}）`);
               } else {
                 console.warn(`  ⚠️  下單失敗：${trade.reason || trade.entry?.orders?.map(o => o.step + ':' + o.detail).join('；')}`);
               }
@@ -722,8 +725,12 @@ async function runScan() {
           `進場 ${p3.entry}（限價等回踩，${Math.round(ORDER_TTL_MS / 3600000)}h 未成交取消）`,
           `停損 ${p3.stop}　R=${p3.R.toFixed(6)}`,
           `停利 ${p3.targets.map(t => `${t.multiple}R→${t.price}`).join('　')}`,
-          `數量 ${p3.qtyEach} × 2 批　風險 ${p3.actualRiskUSD} USD（權益 ${p3.equity}）`
+          `數量 ${p3.qtyEach} × 2 批　風險 ${p3.actualRiskUSD} USD` +
+            `（${(p3.riskPct * 100).toFixed(2)}%，權益 ${p3.equity}）`
         );
+        if (p3.riskReduced) {
+          lines.push(`🛡 回撤 ${(p3.drawdown * 100).toFixed(1)}% 已超過 ${DRAWDOWN_TRIGGER * 100}%，單筆風險降為 ${RISK_PCT_REDUCED * 100}%`);
+        }
         if (p3.capped) lines.push('⚠️ 數量受可用保證金上限壓縮');
       } else if (s.trade?.skipped) {
         lines.push(`（未下單：${esc(s.trade.reason)}）`);
