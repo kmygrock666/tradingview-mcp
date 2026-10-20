@@ -19,6 +19,8 @@
  *   抓到進場信號就掛限價單等回踩 —— 進場＝3H紅吞「前一根」的最高價，
  *   停損＝該根最低價，R＝兩者之差，停利分 5R 與 10R 兩批各半部位，
  *   單筆風險＝權益 2%；總資金虧損超過 20% 時自動降為 0.5%。
+ *   保本階梯：價格觸及第 N 個停利點後，停損移到第 N−1 個停利點
+ *   （N=1 時移到成本價），每輪檢查一次，只往上搬不往下退。
  *   9 小時（3 根 3H K 棒）沒成交就撤單。
  *   每筆都寫進 trades-jskuang.jsonl，同一根 K 棒不會重複下單。
  *
@@ -37,7 +39,7 @@
 import { connect, disconnect, evaluate, evaluateAsync, getTargetInfo } from '../src/connection.js';
 import { getOhlcv, getStudyValues } from '../src/core/data.js';
 import { removeFromList } from '../src/core/watchlist.js';
-import { tradeSignal, expireStaleOrders, ORDER_TTL_MS, DRAWDOWN_TRIGGER, RISK_PCT_REDUCED } from './lib/jsk-trade.js';
+import { tradeSignal, expireStaleOrders, trailStops, ORDER_TTL_MS, DRAWDOWN_TRIGGER, RISK_PCT_REDUCED } from './lib/jsk-trade.js';
 
 // 自動載入專案根目錄的 .env(已用 export 設定或檔案不存在時略過)
 try { process.loadEnvFile(new URL('../.env', import.meta.url)); } catch {}
@@ -746,6 +748,29 @@ async function runScan() {
     console.log(`  無進場信號`);
   }
 
+  // 保本階梯：價格到了第 N 個停利點，就把停損往上搬到第 N−1 階
+  // （N=1 時搬到成本價）。放在下單之後跑，這輪剛成交的單也會一起檢查。
+  let trailNote = null;
+  if (TRADING_ENABLED) {
+    try {
+      const t = await trailStops();
+      if (t.moved.length) {
+        trailNote = t.moved
+          .map(m => `${m.symbol.split(':').pop()} 停損→${m.newStop}（${m.breakeven ? '保本' : '鎖 ' + m.stage}）`)
+          .join('\n');
+        console.log(`  🛡 移動停損：${trailNote.split('\n').join('、')}`);
+      }
+      if (t.failed.length) {
+        const f = t.failed.map(m => `${m.symbol.split(':').pop()}：${m.detail}`).join('\n');
+        trailNote = (trailNote ? trailNote + '\n' : '') + `⚠️ 移動停損失敗：\n${f}`;
+        console.warn(`  ⚠️  移動停損失敗：${f.split('\n').join('、')}`);
+      }
+    } catch (e) {
+      trailNote = `移動停損檢查失敗：${e.message}`;
+      console.error('  ⚠️ ', trailNote);
+    }
+  }
+
   // 掛超過 9 小時（3 根 3H K 棒）還沒成交的限價單要撤掉，
   // 否則信號早就失效了單還掛在那裡等。
   let expiredNote = null;
@@ -773,6 +798,7 @@ async function runScan() {
   ];
   if (!REMOVAL_ENABLED) summary.push('（3D 移除檢查暫停中）');
   if (!TRADING_ENABLED) summary.push('（自動下單已關閉）');
+  if (trailNote) summary.push(esc(trailNote));
   if (expiredNote) summary.push(esc(expiredNote));
   if (emptyLists.length) summary.push(`⚠️ 讀到 0 個標的的清單：${esc(emptyLists.join('、'))}`);
   if (removalNote) summary.push(esc(removalNote));

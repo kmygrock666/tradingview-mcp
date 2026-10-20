@@ -53,6 +53,22 @@ const PAGE_HELPERS = `
   function chartSymbol() {
     try { return ${CHART_API}.symbol(); } catch (e) { return null; }
   }
+  // 頁面端關閉訂單視窗（清場用，避免殘留的視窗擋住後續點擊）
+  async function closeTicketInPage() {
+    var t = ticket();
+    if (!t) return true;
+    var host = t;
+    for (var i = 0; i < 6 && host; i++, host = host.parentElement) {
+      var x = Array.prototype.slice.call(host.querySelectorAll('button, [role="button"]')).filter(function(b){
+        if (b.offsetParent === null) return false;
+        var k = (b.getAttribute('aria-label') || '') + (b.getAttribute('data-name') || '')
+          + (typeof b.className === 'string' ? b.className : '');
+        return /close|關閉/i.test(k);
+      })[0];
+      if (x) { x.click(); await sleep(400); break; }
+    }
+    return !ticket();
+  }
 `;
 
 // 「出場水平」子面板：一張訂單可以帶多層出場，每層有自己的數量／停利／停損。
@@ -82,11 +98,22 @@ const PAGE_EXIT_LEVELS = `
     });
     return true;
   }
-  // 展開中的那層固定是三個欄位：單位 / 停利 / 停損
+  // 展開中那層的三個欄位（單位 / 停利 / 停損）不一定在 levelsPanel() 選到的
+  // 容器裡：訂單視窗的在裡面，部位編輯器的在外層兄弟節點。往上找到真的有
+  // 欄位的那層容器為止，否則會回報「只有 0 個欄位」。
+  function levelInputs() {
+    var host = levelsPanel();
+    for (var i = 0; i < 5 && host; i++, host = host.parentElement) {
+      var ins = Array.prototype.slice.call(host.querySelectorAll('input'))
+        .filter(function(x){ return x.type !== 'checkbox'; });
+      if (ins.length >= 3) return ins;
+    }
+    return [];
+  }
   async function setExpandedLevel(qty, tp, sl) {
     var pnl = levelsPanel();
     if (!pnl) return '面板不見了';
-    var ins = Array.prototype.slice.call(pnl.querySelectorAll('input')).filter(function(i){ return i.type !== 'checkbox'; });
+    var ins = levelInputs();
     if (ins.length < 3) return '展開中的水平只有 ' + ins.length + ' 個欄位';
     var tail = ins.slice(-3);
     setInput(tail[0], qty); await sleep(500);
@@ -149,8 +176,7 @@ const PAGE_EXIT_LEVELS = `
       var n = parseFloat(tok);
       if (isFinite(n)) nums.push(n);
     });
-    Array.prototype.slice.call(pnl.querySelectorAll('input')).forEach(function(i){
-      if (i.type === 'checkbox') return;
+    levelInputs().forEach(function(i){
       var n = parseFloat(String(i.value).split(',').join(''));
       if (isFinite(n)) nums.push(n);
     });
@@ -606,10 +632,18 @@ export async function listPositions() {
     return { ok: true, rows: rows.map(function(e){
       var cells = (e.innerText || '').split(String.fromCharCode(10)).join(String.fromCharCode(9))
         .split(String.fromCharCode(9)).map(function(s){ return s.trim(); }).filter(Boolean);
+      // 欄位順序固定：[0]商品 [1]方向 [2]數量 [3]均價 [4]停利 [5]停損 [6]最新價 [7]未實現
+      // 停利/停損在多層出場時顯示成「2個水平」，所以不能用「第幾個數字」來找最新價。
+      var num = function(s){ var v = parseFloat(String(s).replace(/,/g, '')); return isFinite(v) ? v : null; };
       return {
         symbol: cells.filter(function(c){ return c.indexOf(':') >= 0; })[0] || null,
         side: cells.filter(function(c){ return c === '做多' || c === '做空'; })[0] || null,
-        cells: cells.slice(0, 8)
+        qty: num(cells[2]),
+        avg: num(cells[3]),
+        last: num(cells[6]),
+        upnl: num(cells[7]),
+        levels: (cells[4] || '').indexOf('個水平') >= 0 ? parseInt(cells[4], 10) : 1,
+        cells: cells.slice(0, 10)
       };
     }) };
   })()`);
@@ -637,6 +671,156 @@ export async function openExposure() {
     orderCount: orders.count || 0,
     positionCount: (positions.rows || []).length,
   };
+}
+
+/**
+ * 用新的停損價重建一個部位的出場水平（停利價與各批數量維持不變）。
+ *
+ * 收合的水平在 UI 上點不開 —— TradingView 只提供新增與刪除，沒有就地編輯。
+ * 所以移動停損只能「全部刪掉再照原樣加回來」，差別只在停損價。
+ *
+ * levels: [{ tp }] 由呼叫端提供（順序＝水平順序），數量一律均分。
+ */
+export async function rebuildPositionExits({ symbol, levels, stopPrice, posQty = null }) {
+  // 部位數量由呼叫端傳進來最可靠：部位編輯器的面板容器裡沒有數量標題
+  // （訂單視窗的有，所以同一段讀法在那邊可以、在這邊不行）。
+  const payload = JSON.stringify({ symbol, levels, stopPrice, posQty });
+  return evaluateAsync(`(async function(){
+    ${PAGE_HELPERS}
+    ${PAGE_EXIT_LEVELS}
+    var p = ${payload};
+    var log = [];
+    // 失敗時一定要按「捨棄」：這個流程中途會把原本的水平全部刪掉，面板就這樣
+    // 留著的話，畫面上是一個沒有出場計畫的半成品，還會擋住之後的所有操作。
+    // 捨棄不會動到真正的部位（沒按確認就不生效）。
+    function fail(step, detail) {
+      try {
+        var d = Array.prototype.slice.call(document.querySelectorAll('button')).filter(function(b){
+          return b.offsetParent !== null && (b.textContent || '').trim() === '捨棄';
+        })[0];
+        if (d) d.click();
+      } catch (e) { /* 收不掉就算了，至少把錯誤回報出去 */ }
+      return { ok: false, step: step, detail: detail, log: log };
+    }
+
+    // 先清場：上一次失敗可能留著下單視窗或編輯面板，不收掉會點錯東西
+    for (var c = 0; c < 3; c++) {
+      var leftover = Array.prototype.slice.call(document.querySelectorAll('button')).filter(function(b){
+        return b.offsetParent !== null && (b.textContent || '').trim() === '捨棄';
+      })[0];
+      if (!leftover) break;
+      leftover.click();
+      await sleep(600);
+    }
+    if (ticket()) { await closeTicketInPage(); }
+
+    // 切到持倉分頁，而且要確認真的切過去了（訂單分頁也有 ✏，點錯會開成改單）
+    function positionRows() {
+      var els = Array.prototype.slice.call(document.querySelectorAll('div, tr')).filter(function(e){
+        var t = e.innerText || '';
+        return e.offsetParent !== null && t.length < 400 && /做多|做空/.test(t)
+          && e.querySelector('[data-name="edit-settings-cell-button"]');
+      });
+      return els.filter(function(e){ return !els.some(function(o){ return o !== e && e.contains(o); }); });
+    }
+    var tab = Array.prototype.slice.call(document.querySelectorAll('button')).filter(function(b){
+      return b.offsetParent !== null && (b.textContent || '').trim().indexOf('持倉') === 0;
+    })[0];
+    if (!tab) return fail('tab', '找不到持倉分頁');
+    tab.click();
+    for (var w = 0; w < 20 && !positionRows().length; w++) await sleep(150);
+    if (!positionRows().length) return fail('tab', '切到持倉後讀不到任何部位列');
+
+    var rows = positionRows().filter(function(e){ return (e.innerText || '').indexOf(p.symbol) >= 0; });
+    if (!rows.length) return fail('row', '持倉裡找不到 ' + p.symbol);
+    rows[0].querySelector('[data-name="edit-settings-cell-button"]').click();
+    // 面板出現的時間會隨部位數與負載變動，用輪詢不要寫死
+    for (var w2 = 0; w2 < 30 && !levelsPanel(); w2++) await sleep(150);
+    if (!levelsPanel()) return fail('panel', '出場水平面板沒開啟（等了 4.5 秒）');
+
+    // 部位數量（決定每批數量，必須落在商品的數量步長上）
+    var qtyToken = null;
+    if (p.posQty != null) {
+      qtyToken = String(p.posQty);
+    } else {
+      var lines = panelLines();
+      var qtyLine = lines.filter(function(s){ return s.indexOf('多單') === 0 || s.indexOf('空單') === 0
+        || s.indexOf('買進') === 0 || s.indexOf('賣出') === 0; })[0] || '';
+      qtyToken = qtyLine.split(' ').filter(function(s){ return s && !isNaN(parseFloat(s.replace(/,/g, ''))); })[0];
+    }
+    if (!qtyToken) return fail('qty', '讀不到部位數量（呼叫端也沒提供 posQty）');
+    var posQty = parseFloat(String(qtyToken).replace(/,/g, ''));
+    var decimals = (String(qtyToken).split('.')[1] || '').length;
+    var each = (posQty / p.levels.length).toFixed(decimals + 1);
+    log.push('部位 ' + posQty + ' → 每批 ' + each);
+
+    // 收合的水平改不動，只能重建；但「先刪光再加」行不通 —— 刪到最後一層時
+    // 面板會退回基本編輯器（沒有「保護倉位大小」），levelsPanel() 變成 null。
+    // 所以改成「先加新的、再刪舊的」：中間會短暫顯示 200%，但沒按確認就不生效。
+    function levelRows() {
+      var pnl = levelsPanel();
+      if (!pnl) return [];
+      var rows = Array.prototype.slice.call(pnl.querySelectorAll('*')).filter(function(e){
+        if (e.offsetParent === null) return false;
+        var t = e.innerText || '';
+        return t.length < 300 && t.indexOf('水平') === 0 && t.indexOf('TP ') >= 0;
+      });
+      // 只留最內層那些列，並照畫面順序排（舊的在前、新加的在後）
+      return rows.filter(function(e){ return !rows.some(function(o){ return o !== e && e.contains(o); }); });
+    }
+    function deleteRow(row) {
+      var btns = Array.prototype.slice.call(row.querySelectorAll('button, [role="button"]'))
+        .filter(function(b){ return b.offsetParent !== null; });
+      if (!btns.length) return false;
+      var del = btns[btns.length - 1], rc = del.getBoundingClientRect();
+      ['mousedown','mouseup','click'].forEach(function(k){
+        del.dispatchEvent(new MouseEvent(k, { bubbles:true, cancelable:true, view:window,
+          clientX: rc.left + rc.width/2, clientY: rc.top + rc.height/2 }));
+      });
+      return true;
+    }
+    var origCount = levelRows().length;
+    log.push('原有水平 ' + origCount + ' 層');
+
+    // 照原本的停利價加上新的層，只有停損換成新的
+    for (var i = 0; i < p.levels.length; i++) {
+      if (!levelsPanel()) return fail('add', '面板不見了（第 ' + (i + 1) + ' 層）');
+      if (!clickAddLevel(levelsPanel())) return fail('add', '第 ' + (i + 1) + ' 層新增失敗');
+      await sleep(900);
+      var err = await setExpandedLevel(each, p.levels[i].tp, p.stopPrice);
+      if (err) return fail('set', '第 ' + (i + 1) + ' 層設定失敗：' + err);
+      log.push('水平' + (i + 1) + ' ' + each + ' @ TP ' + p.levels[i].tp + ' / SL ' + p.stopPrice);
+    }
+
+    // 新的加好了，把原本那幾層刪掉（它們固定排在前面）
+    for (var d2 = 0; d2 < origCount; d2++) {
+      var rowsNow = levelRows();
+      if (rowsNow.length <= p.levels.length) break;
+      if (!deleteRow(rowsNow[0])) return fail('delete', '刪不掉第 ' + (d2 + 1) + ' 層舊水平');
+      await sleep(700);
+    }
+    log.push('已刪除 ' + origCount + ' 層舊水平');
+
+    var pct = protectionPct();
+    if (!(Math.abs(pct - 100) < 1.5)) return fail('pct', '保護倉位大小 ' + pct + '%，不是 100%');
+    if (!levelShown(p.stopPrice)) return fail('verify', '面板看不到新停損 ' + p.stopPrice + '：' + panelDigest());
+    for (var j = 0; j < p.levels.length; j++) {
+      if (!levelShown(p.levels[j].tp)) return fail('verify', '面板看不到停利 ' + p.levels[j].tp);
+    }
+    log.push('保護倉位大小 ' + pct + '%');
+
+    if (!clickLevelsConfirm()) return fail('confirm', '找不到水平面板的確認');
+    await sleep(1500);
+
+    // 後端拒絕只會跳 toast，不讀就會把失敗當成功（數量步長不合法是常見原因）
+    var toast = Array.prototype.slice.call(document.querySelectorAll('*')).filter(function(e){
+      var t = (e.innerText || '');
+      return e.offsetParent !== null && t.length < 200 && /無法修改|步長|not a multiple/.test(t);
+    }).map(function(e){ return (e.innerText || '').replace(/\\s+/g, ' ').trim(); })[0];
+    if (toast) return fail('rejected', '後端拒絕：' + toast.slice(0, 120));
+
+    return { ok: true, log: log, posQty: posQty, each: each };
+  })()`);
 }
 
 /** 關閉訂單視窗（不送出） */

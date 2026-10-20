@@ -13,7 +13,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicket, openExposure, ensureTradingPanel } from './paper-order.js';
+import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicket, openExposure, ensureTradingPanel, listPositions, rebuildPositionExits } from './paper-order.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const JOURNAL = path.join(ROOT, 'trades-jskuang.jsonl');
@@ -191,6 +191,75 @@ export async function expireStaleOrders({ ttlMs = ORDER_TTL_MS, now = Date.now()
     expired.push({ symbol: e.symbol, cancelled: res.cancelled?.length || 0 });
   }
   return { expired, checked: stale.length };
+}
+
+/**
+ * 保本階梯：價格觸及第 N 個停利點後，把停損移到第 N−1 個停利點。
+ * N=1（第一個停利點）時移到成本價，也就是「到 5R 先保本」。
+ *
+ * 寫成通用的：階梯直接由該筆的 targets 推導，所以日後把 TP_MULTIPLES
+ * 加到三個以上，移動停損會自動照同一個規則跑，不用再改這裡。
+ *
+ * 停損只會往上移、不會往下退（往下移等於擴大風險）。每次移動都寫進帳本，
+ * 下一輪才知道已經移到哪一階。
+ */
+export function stopLadderFor(trade, price) {
+  const targets = trade.targets || [];
+  let reached = 0;
+  targets.forEach((t, i) => { if (price >= t.price) reached = i + 1; });
+  if (!reached) return null;
+  const newStop = reached === 1 ? trade.entry : targets[reached - 2].price;
+  return {
+    reached,
+    stage: `${targets[reached - 1].multiple}R`,
+    newStop,
+    breakeven: reached === 1,
+    // 移到哪一階（保本時是成本價），通知裡要講清楚鎖住了多少
+    lockedAt: reached === 1 ? '成本價' : `${targets[reached - 2].multiple}R`,
+  };
+}
+
+/** 帳本裡這筆單目前的停損（含先前移動過的紀錄） */
+export function currentStopOf(trade, journal = readJournal()) {
+  const moves = journal.filter(e => e.status === 'stop-moved' && e.ref === trade.ts);
+  return moves.length ? moves[moves.length - 1].newStop : trade.stop;
+}
+
+export async function trailStops() {
+  const journal = readJournal();
+  const trades = journal.filter(e => e.entry && !e.dryRun && e.status === 'placed');
+  const positions = await listPositions();
+  const moved = [], failed = [];
+
+  for (const pos of positions.rows || []) {
+    if (!pos.symbol || pos.last == null) continue;
+    // 同一標的可能交易過多次，取最近一筆
+    const trade = trades.filter(t => t.symbol === pos.symbol).slice(-1)[0];
+    if (!trade) continue;
+
+    const ladder = stopLadderFor(trade, pos.last);
+    if (!ladder) continue;
+    const cur = currentStopOf(trade, journal);
+    // 浮點數比較留一點容差，免得每輪都重做同一次移動
+    if (!(ladder.newStop > cur * (1 + 1e-9))) continue;
+
+    const r = await rebuildPositionExits({
+      symbol: pos.symbol,
+      levels: trade.targets.map(t => ({ tp: t.price })),
+      stopPrice: ladder.newStop,
+      posQty: pos.qty,
+    });
+    const record = {
+      ts: new Date().toISOString(), ref: trade.ts, symbol: pos.symbol,
+      status: r.ok ? 'stop-moved' : 'stop-move-failed',
+      price: pos.last, stage: ladder.stage, oldStop: cur, newStop: ladder.newStop,
+      breakeven: ladder.reached === 1,
+      detail: r.ok ? null : `${r.step}：${r.detail}`,
+    };
+    appendJournal(record);
+    (r.ok ? moved : failed).push(record);
+  }
+  return { moved, failed, checked: (positions.rows || []).length };
 }
 
 /** 給監控器用的一條龍：算計畫 → 下單 → 回傳可直接寫進通知的摘要 */
