@@ -203,10 +203,20 @@ export async function expireStaleOrders({ ttlMs = ORDER_TTL_MS, now = Date.now()
  * 停損只會往上移、不會往下退（往下移等於擴大風險）。每次移動都寫進帳本，
  * 下一輪才知道已經移到哪一階。
  */
-export function stopLadderFor(trade, price) {
+export function stopLadderFor(trade, price, remainingQty = null) {
   const targets = trade.targets || [];
   let reached = 0;
   targets.forEach((t, i) => { if (price >= t.price) reached = i + 1; });
+
+  // 只看現價會漏掉：監控器 30 分鐘才檢查一次，價格衝到 5R 讓停利成交、
+  // 再跌回來，下次檢查就看不出曾經到價（ZAMA、SOON 都是這樣錯過的）。
+  // 但「已經有幾批出場」是不會騙人的 —— 某一批出場就代表它的目標價被打到過。
+  if (remainingQty != null && trade.qtyEach > 0) {
+    const legsLeft = Math.round(remainingQty / trade.qtyEach);
+    const legsExited = Math.max(0, targets.length - legsLeft);
+    if (legsExited > reached) reached = Math.min(legsExited, targets.length);
+  }
+
   if (!reached) return null;
   const newStop = reached === 1 ? trade.entry : targets[reached - 2].price;
   return {
@@ -233,11 +243,20 @@ export async function trailStops() {
 
   for (const pos of positions.rows || []) {
     if (!pos.symbol || pos.last == null) continue;
-    // 同一標的可能交易過多次，取最近一筆
-    const trade = trades.filter(t => t.symbol === pos.symbol).slice(-1)[0];
-    if (!trade) continue;
+    // 同一個標的會交易很多次（八天內 206 筆裡不乏重複的幣），不能只取「最後
+    // 一筆」—— 那常常是還沒成交的新單，目標價跟手上這個部位對不起來，階梯
+    // 就永遠不會觸發。改用持倉均價去配對：進場價最接近的那筆才是這個部位。
+    const cands = trades.filter(t => t.symbol === pos.symbol);
+    let trade = null, bestDiff = Infinity;
+    for (const c of cands) {
+      const diff = Math.abs(c.entry - pos.avg) / (pos.avg || 1);
+      if (diff < bestDiff) { bestDiff = diff; trade = c; }
+    }
+    // 差超過 5% 就不是同一筆，寧可不動也不要用錯的目標價去搬停損
+    if (!trade || bestDiff > 0.05) continue;
 
-    const ladder = stopLadderFor(trade, pos.last);
+    // 把剩餘數量也交給階梯判斷：某一批已出場＝那個目標價一定到過
+    const ladder = stopLadderFor(trade, pos.last, pos.qty);
     if (!ladder) continue;
     const cur = currentStopOf(trade, journal);
     // 浮點數比較留一點容差，免得每輪都重做同一次移動
