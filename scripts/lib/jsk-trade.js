@@ -18,6 +18,7 @@ import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicke
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const JOURNAL = path.join(ROOT, 'trades-jskuang.jsonl');
 
+export const STRATEGY_VERSION = 'v2';  // 進場條件版本，寫進帳本方便分開統計
 export const RISK_PCT = 0.02;          // 單筆風險 = 權益的 2%
 export const TP_MULTIPLES = [5, 10];   // 兩批停利
 export const ORDER_TTL_MS = 9 * 3600 * 1000;  // 限價單有效期：3 根 3H K 棒
@@ -29,7 +30,10 @@ const MIN_AVAILABLE_PCT = 0.25;        // 可用資金低於權益的 25% 就不
 // 總資金虧損超過 20% 就把單筆風險從 2% 調降到 0.5%，讓策略在逆風時
 // 自動縮小部位，不必等人介入。基準是「實驗起始權益」，不是歷史最高點 ——
 // 照字面的「總資金虧損」解釋；要改成以最高點計算把 INITIAL_EQUITY 換掉即可。
-export const INITIAL_EQUITY = 973.75;      // 2026-10-16 15:47 開始實驗時的權益
+// 2026-10-24 進場條件改版（v2 回踩買進），舊策略的 206 筆已歸檔到
+// trades-jskuang-v1-20261023.jsonl，基準權益重設為改版當下的數字，
+// 回撤與風險分檔都從這裡重新起算（舊策略最終權益 973.75 → 492.13）。
+export const INITIAL_EQUITY = 492.13;      // 2026-10-24 v2 起始權益
 export const DRAWDOWN_TRIGGER = 0.20;      // 虧損超過 20%
 export const RISK_PCT_REDUCED = 0.005;     // 觸發後的單筆風險
 
@@ -153,7 +157,7 @@ export async function placeSignalOrders({ symbol, plan, barTime, dryRun = false 
     targets: plan.targets, qtyEach: plan.qtyEach, qtyTotal: plan.qtyTotal,
     riskUSD: plan.riskUSD, actualRiskUSD: plan.actualRiskUSD, equity: plan.equity,
     riskPct: plan.riskPct, drawdown: plan.drawdown, riskReduced: plan.riskReduced,
-    capped: plan.capped, dryRun,
+    capped: plan.capped, dryRun, strategy: STRATEGY_VERSION,
     orders: results, orderIds,
     status: results.some(r => r.ok) ? 'placed' : 'failed',
   };
@@ -168,8 +172,15 @@ export async function placeSignalOrders({ symbol, plan, barTime, dryRun = false 
  */
 export async function expireStaleOrders({ ttlMs = ORDER_TTL_MS, now = Date.now() } = {}) {
   const journal = readJournal();
+  // 已經處理過的不要再處理：原紀錄的狀態永遠是 placed，不排除掉的話每一輪
+  // 都會對同一批舊單再寫一次 closed-or-filled —— 206 筆交易因此長出三萬行。
+  const resolved = new Set(
+    journal.filter(e => e.ref && (e.status === 'expired' || e.status === 'closed-or-filled'))
+      .map(e => e.ref)
+  );
   const stale = journal.filter(e =>
-    e.status === 'placed' && !e.dryRun && (now - new Date(e.ts).getTime()) > ttlMs);
+    e.status === 'placed' && !e.dryRun && !resolved.has(e.ts)
+    && (now - new Date(e.ts).getTime()) > ttlMs);
   if (!stale.length) return { expired: [], checked: 0 };
 
   const live = await listOrders();

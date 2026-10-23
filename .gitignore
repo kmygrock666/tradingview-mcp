@@ -4,7 +4,7 @@ scripts/current.pine
 temp_*
 *.log
 *.log.prev
-trades-jskuang.jsonl
+trades-jskuang*.jsonl
 discovery-log.json
 rules.json
 
