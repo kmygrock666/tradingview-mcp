@@ -4,11 +4,16 @@
  *
  * 監控清單（TradingView watchlist 頁籤）：極速匡、加密貨幣
  *
- * 進場條件（三者同時成立）：
- *   1. 1D：當前為「紅吞」，或前一根日K為「黑吞」/「收黑K」
- *   2. 3H：當前「紅吞」且前 5 根內曾出現「黑吞」（黑吞後轉紅吞），
- *      且收盤站上「7EMA_5MA」指標的 MA 線（MA 1）
- *   3. 最近 3 根 1H K棒收盤連續墊高（底底高）
+ * 進場條件（2026-10-24 改版，做多，四項全部成立）：
+ *   1. 3D：前一根為「黑吞」
+ *   2. 1D：下列兩種型態之一
+ *      A. 當前「紅吞」，且當前低點不低於前一根低點，
+ *         且當前高點曾經突破「7EMA_5MA」的 MA 1
+ *      B. 前面連續 2 根以上皆為「紅吞」，而當前為「黑吞」且收黑
+ *   3. 3H：當前「黑吞」，且低點沒有跌破「前面最近一根紅吞」的低點
+ *   4. 1H：當前跌破前一根低點且收黑 ← 這根就是進場依據
+ *
+ *   型態是「大週期轉弱、小週期洗盤，但關鍵低點沒破」的回踩買進。
  *
  * 極速匡移除條件（僅極速匡頁籤）── 目前【暫停中】，見 REMOVAL_ENABLED：
  *   3D 上漲結構被破壞 → 自清單移除並通知。
@@ -16,7 +21,7 @@
  *   最低價（含下影線）即成立。單純出現 3D 黑吞但沒收破紅吞低點不算。
  *
  * 自動下單（模擬交易「極速匡帳戶」，見 TRADING_ENABLED）：
- *   抓到進場信號就掛限價單等回踩 —— 進場＝3H紅吞「前一根」的最高價，
+ *   抓到進場信號就掛限價單 —— 進場＝1H 觸發那根（條件 4）的最高價，
  *   停損＝該根最低價，R＝兩者之差，停利分 5R 與 10R 兩批各半部位，
  *   單筆風險＝權益 2%；總資金虧損超過 20% 時自動降為 0.5%。
  *   保本階梯：價格觸及第 N 個停利點後，停損移到第 N−1 個停利點
@@ -503,49 +508,62 @@ async function checkRemoval3D(tvSym) {
 async function checkEntry(tvSym) {
   const displayName = tvSym.split(':').pop().replace('.P', '');
   try {
-    // 條件1：1D 當前紅吞，或前一根日K為黑吞/收黑K
-    await switchTo(tvSym, 'D');
-    const dBars = await waitForChart(tvSym, 'D', 2, 3);
+    // 條件1：3D 前一根為黑吞（看的是前一根，不是當前這根）
+    await switchTo(tvSym, '3D');
+    const bars3d = await waitForChart(tvSym, '3D', 3, 4);
+    const prev3d = bars3d[bars3d.length - 2];
+    const prev2_3d = bars3d[bars3d.length - 3];
+    if (!prev2_3d || !isBearEngulf(prev3d, prev2_3d)) return null;
+
+    // 條件2：1D 兩種型態之一
+    await switchTF('D');
+    // 型態 B 要往回看「連續 2 根以上紅吞」，所以要多抓幾根
+    const dBars = await waitForChart(tvSym, 'D', 4, 8);
     const currD = dBars[dBars.length - 1];
     const prevD = dBars[dBars.length - 2];
-    const prev2D = dBars[dBars.length - 3];
+
+    // 型態 A：當前紅吞 + 低點不低於前一根 + 高點曾突破 MA 1
     let d1Signal = null;
-    if (isBullEngulf(currD, prevD)) d1Signal = '紅吞';
-    else if (prev2D && isBearEngulf(prevD, prev2D)) d1Signal = '前根黑吞';
-    else if (prevD.close < prevD.open) d1Signal = '前根收黑K';
+    if (isBullEngulf(currD, prevD) && currD.low >= prevD.low) {
+      // MA 值要在 1D 這個週期上讀，讀不到會丟錯由本輪摘要回報
+      const maVal = await waitForMaValue();
+      if (currD.high > maVal) d1Signal = `1D紅吞不破前低且高點過MA(${maVal})`;
+    }
+
+    // 型態 B：前面連續 2 根以上紅吞，當前黑吞且收黑
+    if (!d1Signal && isBearEngulf(currD, prevD) && currD.close < currD.open) {
+      let bullRun = 0;
+      for (let i = dBars.length - 2; i >= 1; i--) {
+        if (isBullEngulf(dBars[i], dBars[i - 1])) bullRun++;
+        else break;
+      }
+      if (bullRun >= 2) d1Signal = `1D連${bullRun}根紅吞後黑吞收黑`;
+    }
     if (!d1Signal) return null;
 
-    // 條件2：切換至 3H，當前紅吞且前 5 根內曾出現黑吞（黑吞後轉紅吞）
+    // 條件3：3H 當前黑吞，且低點沒跌破「前面最近一根紅吞」的低點
     await switchTF('180');
-    const bars3h = await waitForChart(tvSym, '180', 6, 7);
-
+    const bars3h = await waitForChart(tvSym, '180', 6, 12);
     const curr3h = bars3h[bars3h.length - 1];
     const prev3h = bars3h[bars3h.length - 2];
-    if (!isBullEngulf(curr3h, prev3h)) return null;
+    if (!isBearEngulf(curr3h, prev3h)) return null;
+    // 從前一根往回找紅吞當作要守住的低點；找不到就不成立（沒有可守的結構）
+    const anchorIdx = findLastBullEngulfIdx(bars3h, bars3h.length - 2);
+    if (anchorIdx < 0) return null;
+    const anchor3h = bars3h[anchorIdx];
+    if (curr3h.low < anchor3h.low) return null;
 
-    let hadBearEngulf = false;
-    for (let i = 1; i <= 5; i++) {
-      const c = bars3h[bars3h.length - 1 - i];
-      const p = bars3h[bars3h.length - 2 - i];
-      if (!c || !p) break;
-      if (isBearEngulf(c, p)) { hadBearEngulf = true; break; }
-    }
-    if (!hadBearEngulf) return null;
-
-    // 條件2b：3H 收盤需站上 EMA/MA 指標的 MA 線
-    const maVal = await waitForMaValue();
-    if (curr3h.close <= maVal) return null;
-
-    // 條件3：切換至 1H，取最近 3 根收盤連續墊高
+    // 條件4：1H 當前跌破前一根低點且收黑 ← 這根就是下單依據
     await switchTF('60');
-    const b = await waitForChart(tvSym, '60', 3, 4);
-    const h1_higher = b[b.length - 3].close < b[b.length - 2].close &&
-      b[b.length - 2].close < b[b.length - 1].close;
-    if (!h1_higher) return null;
+    const bars1h = await waitForChart(tvSym, '60', 2, 4);
+    const curr1h = bars1h[bars1h.length - 1];
+    const prev1h = bars1h[bars1h.length - 2];
+    if (!(curr1h.low < prev1h.low && curr1h.close < curr1h.open)) return null;
 
-    // prevBar 就是下單依據：進場＝它的高點，停損＝它的低點
-    return { symbol: tvSym, displayName, price: curr3h.close, barTime: curr3h.time, d1Signal,
-             prevBar: { high: prev3h.high, low: prev3h.low, time: prev3h.time } };
+    // 進場＝這根 1H 的最高價，停損＝它的最低價
+    return { symbol: tvSym, displayName, price: curr1h.close, barTime: curr1h.time, d1Signal,
+             anchor3h: anchor3h.low,
+             prevBar: { high: curr1h.high, low: curr1h.low, time: curr1h.time } };
   } catch (e) {
     // 單一幣對失敗不中斷整輪，但要記下來讓本輪摘要看得到，不靜默吞掉
     return { error: e.message || String(e) };
@@ -719,7 +737,7 @@ async function runScan() {
     for (const s of signals) {
       const lines = [
         `${s.displayName}  @${s.price}`,
-        `1D${s.d1Signal} + 3H黑吞轉紅吞站上MA + 1H底底高`,
+        `3D前根黑吞 + ${s.d1Signal} + 3H黑吞不破紅吞低(${s.anchor3h}) + 1H跌破前低收黑`,
       ];
       if (s.trade?.ok) {
         const p3 = s.trade.plan;

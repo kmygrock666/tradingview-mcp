@@ -13,7 +13,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicket, openExposure, ensureTradingPanel, listPositions, rebuildPositionExits } from './paper-order.js';
+import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicket, openExposure, ensureTradingPanel, listPositions, rebuildPositionExits, setPositionSimpleExits } from './paper-order.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const JOURNAL = path.join(ROOT, 'trades-jskuang.jsonl');
@@ -262,21 +262,49 @@ export async function trailStops() {
     // 浮點數比較留一點容差，免得每輪都重做同一次移動
     if (!(ladder.newStop > cur * (1 + 1e-9))) continue;
 
-    const r = await rebuildPositionExits({
+    // 只重建「還沒出場」的那幾層：已經在 5R 停利的那半已經走了，
+    // 照原本兩層去建會把剩下的部位再切一半、還掛上一個早就該消失的停利，
+    // 驗證當然過不了（2026-10-24 SOON、ZAMA 第一次觸發就是卡在這裡）。
+    const legsLeft = Math.round(pos.qty / trade.qtyEach);
+    if (!(legsLeft >= 1)) continue;
+    const remaining = trade.targets.slice(Math.max(0, trade.targets.length - legsLeft));
+
+    // 只剩一層時走基本編輯器：水平的加刪順序不受控，能不碰就不碰
+    const r = remaining.length === 1
+      ? await setPositionSimpleExits({
+          symbol: pos.symbol, tp: remaining[0].price, stopPrice: ladder.newStop, posQty: pos.qty,
+        })
+      : await rebuildPositionExits({
       symbol: pos.symbol,
-      levels: trade.targets.map(t => ({ tp: t.price })),
+      levels: remaining.map(t => ({ tp: t.price })),
       stopPrice: ladder.newStop,
       posQty: pos.qty,
     });
+    // 「面板驗證通過」不等於「後端真的改了」：2026-10-24 第一次觸發時，UI
+    // 全綠、帳本記成已移動，實際的停損單卻還停在原價，於是之後每輪都以為
+    // 移過了而跳過。改成送出後回頭讀真正的停損單來確認。
+    let verified = false, liveStop = null;
+    if (r.ok) {
+      const live = await listOrders();
+      const stops = (live.rows || [])
+        .filter(x => x.symbol === pos.symbol && x.type === '停損' && x.prices.length)
+        .map(x => x.prices[0]);
+      liveStop = stops.length ? Math.max(...stops) : null;
+      verified = liveStop != null
+        && Math.abs(liveStop - ladder.newStop) <= Math.max(1e-9, Math.abs(ladder.newStop) * 1e-4);
+    }
+
     const record = {
       ts: new Date().toISOString(), ref: trade.ts, symbol: pos.symbol,
-      status: r.ok ? 'stop-moved' : 'stop-move-failed',
+      status: r.ok && verified ? 'stop-moved' : 'stop-move-failed',
+      verified, liveStop,
       price: pos.last, stage: ladder.stage, oldStop: cur, newStop: ladder.newStop,
+      legsLeft, remainingTargets: remaining.map(t => t.price),
       breakeven: ladder.reached === 1,
-      detail: r.ok ? null : `${r.step}：${r.detail}`,
+      detail: r.ok ? (verified ? null : `面板通過但實際停損是 ${liveStop}，沒有套用`) : `${r.step}：${r.detail}`,
     };
     appendJournal(record);
-    (r.ok ? moved : failed).push(record);
+    (record.status === 'stop-moved' ? moved : failed).push(record);
   }
   return { moved, failed, checked: (positions.rows || []).length };
 }

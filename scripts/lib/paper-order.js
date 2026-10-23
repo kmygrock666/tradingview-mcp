@@ -77,13 +77,28 @@ const PAGE_HELPERS = `
 // 會在合併時消失，只留下一個涵蓋全部數量的停損 —— 等於分批停利整個失效
 // （2026-10-16 實測 ETH：0.559 的部位只剩 SL，兩個 TP 都不見了）。
 const PAGE_EXIT_LEVELS = `
+  // 取「整個出場水平編輯器」的容器。
+  //
+  // 只取最小的那個會出事：在部位編輯器裡，展開中那層的欄位與部分水平列是
+  // 最小容器的「兄弟節點」，於是 levelRows() 只看得到一部分，刪除指令就打在
+  // 不完整的視野上 —— 2026-10-24 SOON/ZAMA 的停損沒被改到就是這樣來的
+  // （以為刪了舊層，其實新舊都還在，保護倉位變成 200%）。
+  // 作法：先找到最小的匹配容器，再往上爬，取仍在合理大小內的最外層。
   function levelsPanel() {
     var c = Array.prototype.slice.call(document.querySelectorAll('div')).filter(function(d){
       var t = d.innerText || '';
       return d.offsetParent !== null && /保護倉位大小/.test(t) && /捨棄/.test(t) && t.length < 2000;
     });
     c.sort(function(a, b){ return (a.innerText||'').length - (b.innerText||'').length; });
-    return c[0] || null;
+    var base = c[0] || null;
+    if (!base) return null;
+    var best = base;
+    for (var el = base.parentElement, i = 0; el && i < 5; el = el.parentElement, i++) {
+      var t2 = el.innerText || '';
+      if (t2.indexOf('捨棄') < 0 || t2.length > 3000) break;
+      best = el;
+    }
+    return best;
   }
   function clickAddLevel(root) {
     if (!root) return false;
@@ -792,14 +807,18 @@ export async function rebuildPositionExits({ symbol, levels, stopPrice, posQty =
       log.push('水平' + (i + 1) + ' ' + each + ' @ TP ' + p.levels[i].tp + ' / SL ' + p.stopPrice);
     }
 
+    log.push('加完新層：共 ' + levelRows().length + ' 層、保護 ' + protectionPct() + '%');
+
     // 新的加好了，把原本那幾層刪掉（它們固定排在前面）
-    for (var d2 = 0; d2 < origCount; d2++) {
+    var deleted = 0;
+    for (var d2 = 0; d2 < origCount + 3; d2++) {
       var rowsNow = levelRows();
       if (rowsNow.length <= p.levels.length) break;
-      if (!deleteRow(rowsNow[0])) return fail('delete', '刪不掉第 ' + (d2 + 1) + ' 層舊水平');
-      await sleep(700);
+      if (!deleteRow(rowsNow[0])) return fail('delete', '刪不掉舊水平（目前 ' + rowsNow.length + ' 層）');
+      deleted++;
+      await sleep(900);
     }
-    log.push('已刪除 ' + origCount + ' 層舊水平');
+    log.push('刪除 ' + deleted + ' 層後：共 ' + levelRows().length + ' 層、保護 ' + protectionPct() + '%');
 
     var pct = protectionPct();
     if (!(Math.abs(pct - 100) < 1.5)) return fail('pct', '保護倉位大小 ' + pct + '%，不是 100%');
@@ -820,6 +839,168 @@ export async function rebuildPositionExits({ symbol, levels, stopPrice, posQty =
     if (toast) return fail('rejected', '後端拒絕：' + toast.slice(0, 120));
 
     return { ok: true, log: log, posQty: posQty, each: each };
+  })()`);
+}
+
+/**
+ * 直接改部位的停利／停損（基本編輯器，不走「出場水平」）。
+ *
+ * 部位只剩一層出場時這條路簡單得多：把水平刪光，面板就會退回基本編輯器，
+ * 上面是單純的停利/停損價格欄位。多層出場的加加刪刪太不穩 —— 實測刪完
+ * 保護倉位大小會從 100% 跳到 200%，順序與重算時機都不受控。
+ *
+ * 移動停損時部位幾乎都只剩一層（第一批已經在 5R 出場了），所以這是主力路徑。
+ */
+export async function setPositionSimpleExits({ symbol, tp, stopPrice, posQty = null }) {
+  const payload = JSON.stringify({ symbol, tp, stopPrice, posQty });
+  return evaluateAsync(`(async function(){
+    ${PAGE_HELPERS}
+    ${PAGE_EXIT_LEVELS}
+    var p = ${payload};
+    var log = [];
+    function fail(step, detail) {
+      try {
+        var d = Array.prototype.slice.call(document.querySelectorAll('button')).filter(function(b){
+          return b.offsetParent !== null && (b.textContent || '').trim() === '捨棄';
+        })[0];
+        if (d) d.click();
+      } catch (e) {}
+      return { ok: false, step: step, detail: detail, log: log };
+    }
+
+    // 清場 + 切到持倉分頁
+    for (var c = 0; c < 3; c++) {
+      var leftover = Array.prototype.slice.call(document.querySelectorAll('button')).filter(function(b){
+        return b.offsetParent !== null && (b.textContent || '').trim() === '捨棄';
+      })[0];
+      if (!leftover) break;
+      leftover.click();
+      await sleep(600);
+    }
+    if (ticket()) await closeTicketInPage();
+
+    function positionRows() {
+      var els = Array.prototype.slice.call(document.querySelectorAll('div, tr')).filter(function(e){
+        var t = e.innerText || '';
+        return e.offsetParent !== null && t.length < 400 && /做多|做空/.test(t)
+          && e.querySelector('[data-name="edit-settings-cell-button"]');
+      });
+      return els.filter(function(e){ return !els.some(function(o){ return o !== e && e.contains(o); }); });
+    }
+    var tab = Array.prototype.slice.call(document.querySelectorAll('button')).filter(function(b){
+      return b.offsetParent !== null && (b.textContent || '').trim().indexOf('持倉') === 0;
+    })[0];
+    if (!tab) return fail('tab', '找不到持倉分頁');
+    tab.click();
+    for (var w = 0; w < 20 && !positionRows().length; w++) await sleep(150);
+    var rows = positionRows().filter(function(e){ return (e.innerText || '').indexOf(p.symbol) >= 0; });
+    if (!rows.length) return fail('row', '持倉裡找不到 ' + p.symbol);
+    rows[0].querySelector('[data-name="edit-settings-cell-button"]').click();
+    await sleep(1500);
+
+    // 把現有水平全部刪掉，讓面板退回基本編輯器
+    for (var g = 0; g < 6; g++) {
+      var pnl = levelsPanel();
+      if (!pnl) break;                       // 已經是基本編輯器
+      var rowsNow = Array.prototype.slice.call(pnl.querySelectorAll('*')).filter(function(e){
+        if (e.offsetParent === null) return false;
+        var t = e.innerText || '';
+        return t.length < 300 && t.indexOf('水平') === 0 && t.indexOf('TP ') >= 0;
+      });
+      rowsNow = rowsNow.filter(function(e){ return !rowsNow.some(function(o){ return o !== e && e.contains(o); }); });
+      if (!rowsNow.length) break;
+      var btns = Array.prototype.slice.call(rowsNow[0].querySelectorAll('button, [role="button"]'))
+        .filter(function(b){ return b.offsetParent !== null; });
+      if (!btns.length) return fail('delete', '水平列裡沒有刪除鈕');
+      var del = btns[btns.length - 1], rc = del.getBoundingClientRect();
+      ['mousedown','mouseup','click'].forEach(function(k){
+        del.dispatchEvent(new MouseEvent(k, { bubbles:true, cancelable:true, view:window,
+          clientX: rc.left + rc.width/2, clientY: rc.top + rc.height/2 }));
+      });
+      await sleep(800);
+    }
+    log.push('已清掉出場水平，回到基本編輯器');
+
+    // 基本編輯器的容器：用文字找會抓到「退出」那兩個字的標籤本身（len=2），
+    // 改成從「確認」鈕往上爬，取第一個同時含欄位的祖先。
+    function editor() {
+      var ok = Array.prototype.slice.call(document.querySelectorAll('button, [role="button"]')).filter(function(b){
+        return b.offsetParent !== null && /^(確認|修改|套用)$/.test((b.textContent || '').trim());
+      })[0];
+      if (!ok) return null;
+      for (var el = ok.parentElement, i = 0; el && i < 8; el = el.parentElement, i++) {
+        var ins = Array.prototype.slice.call(el.querySelectorAll('input'))
+          .filter(function(x){ return x.offsetParent !== null && x.type !== 'checkbox'; });
+        if (ins.length >= 2) return el;
+      }
+      return null;
+    }
+    var ed = null;
+    for (var w2 = 0; w2 < 20 && !(ed = editor()); w2++) await sleep(200);
+    if (!ed) return fail('editor', '基本編輯器沒出現');
+
+    // 兩個開關要打開（停利、停損），模式確保是價格
+    var checks = Array.prototype.slice.call(ed.querySelectorAll('input[type="checkbox"]'));
+    for (var k = 0; k < checks.length; k++) {
+      if (!checks[k].checked) { checks[k].click(); await sleep(400); }
+    }
+    function modeBtn(prefix) {
+      var e2 = editor();
+      if (!e2) return null;
+      var b = Array.prototype.slice.call(e2.querySelectorAll('button')).filter(function(x){
+        if (x.getAttribute('role') === 'tab') return false;
+        var s = (x.textContent || '').trim();
+        return s.indexOf(prefix) === 0 && s.length > prefix.length && s.length <= 14;
+      })[0];
+      return b ? { btn: b, text: (b.textContent||'').trim() } : null;
+    }
+    async function forcePrice(prefix) {
+      var m = modeBtn(prefix);
+      if (!m) return '找不到「' + prefix + '」模式鈕';
+      if (/價格/.test(m.text)) return null;
+      m.btn.click();
+      await sleep(300);
+      var e3 = editor();
+      var opts = Array.prototype.slice.call(document.querySelectorAll('div, span, li, button')).filter(function(x){
+        return x.offsetParent !== null && (x.textContent || '').trim() === '價格'
+          && x.children.length === 0 && (!e3 || !e3.contains(x));
+      });
+      if (!opts.length) return '「' + prefix + '」找不到價格選項';
+      opts[0].click();
+      await sleep(300);
+      var after = modeBtn(prefix);
+      return (after && /價格/.test(after.text)) ? null : '「' + prefix + '」切不到價格模式';
+    }
+    var e1 = await forcePrice('停利'); if (e1) return fail('tpMode', e1);
+    var e2b = await forcePrice('停損'); if (e2b) return fail('slMode', e2b);
+
+    var ins = Array.prototype.slice.call(editor().querySelectorAll('input'))
+      .filter(function(i){ return i.type !== 'checkbox'; });
+    if (ins.length < 2) return fail('fields', '基本編輯器只有 ' + ins.length + ' 個欄位');
+    setInput(ins[0], p.tp);        await sleep(400);
+    setInput(ins[1], p.stopPrice); await sleep(500);
+    log.push('停利 ' + p.tp + '、停損 ' + p.stopPrice);
+
+    var vals = Array.prototype.slice.call(editor().querySelectorAll('input'))
+      .filter(function(i){ return i.type !== 'checkbox'; }).map(function(i){ return parseFloat(String(i.value).split(',').join('')); });
+    var near = function(a, b){ return isFinite(a) && Math.abs(a - b) <= Math.max(1e-9, Math.abs(b) * 1e-5); };
+    if (!vals.some(function(v){ return near(v, p.stopPrice); })) {
+      return fail('verify', '停損欄位沒吃進去：' + JSON.stringify(vals));
+    }
+
+    var apply = Array.prototype.slice.call(document.querySelectorAll('button, [role="button"]'))
+      .filter(function(b){ return b.offsetParent !== null && /^(確認|修改|套用)$/.test((b.textContent||'').trim()); })[0];
+    if (!apply) return fail('confirm', '找不到確認鈕');
+    apply.click();
+    await sleep(1500);
+
+    var toast = Array.prototype.slice.call(document.querySelectorAll('*')).filter(function(e){
+      var t = (e.innerText || '');
+      return e.offsetParent !== null && t.length < 200 && /無法修改|步長|not a multiple/.test(t);
+    }).map(function(e){ return (e.innerText || '').replace(/\\s+/g, ' ').trim(); })[0];
+    if (toast) return fail('rejected', '後端拒絕：' + toast.slice(0, 120));
+
+    return { ok: true, log: log };
   })()`);
 }
 
