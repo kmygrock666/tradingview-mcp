@@ -120,10 +120,10 @@ async function main() {
   const prev3h = bars3h[bars3h.length - 2];
   const c3 = isBullEngulf(curr3h, prev3h);
   if (c3) passed++;
-  console.log(`\n${mark(c3)} 條件3  3H 當前紅吞（前一根要是黑K、當前高點要過它、自身收紅）`);
+  console.log(`\n${mark(c3)} 條件3  3H 當前紅吞（高點過前一根、自身收紅；不限前一根顏色）`);
   console.log(`         前一根 開${prev3h.open} 高${prev3h.high} 低${prev3h.low} 收${prev3h.close}（${color(prev3h)}K）`);
   console.log(`         當前   開${curr3h.open} 高${curr3h.high} 低${curr3h.low} 收${curr3h.close}（${color(curr3h)}K）`);
-  console.log(`         前根是黑K ${mark(prev3h.close < prev3h.open)}　高點過前根 ${mark(curr3h.high > prev3h.high)}　自身收紅 ${mark(curr3h.close > curr3h.open)}`);
+  console.log(`         高點過前根 ${mark(curr3h.high > prev3h.high)}　自身收紅 ${mark(curr3h.close > curr3h.open)}`);
   if (c3) {
     console.log(`         → 進場 ${prev3h.open}（前根開盤）　停損 ${curr3h.low}（當前低點）`);
   }
