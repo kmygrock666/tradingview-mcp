@@ -18,7 +18,7 @@ import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicke
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const JOURNAL = path.join(ROOT, 'trades-jskuang.jsonl');
 
-export const STRATEGY_VERSION = 'v4';  // 進場條件版本，寫進帳本方便分開統計
+export const STRATEGY_VERSION = 'v4.1';  // 進場條件版本，寫進帳本方便分開統計
 export const RISK_PCT = 0.02;          // 單筆風險 = 權益的 2%
 export const TP_MULTIPLES = [5, 10];   // 舊版（v2）的 R 倍數停利，fibBar 缺席時的後備
 // ── v3 斐波那契定價（使用者 2026-10-25）──────────────────
@@ -73,7 +73,24 @@ function roundPrice(p, ref) {
  * 由「紅吞前一根」K 棒算出完整的下單計畫。
  * prevBar 需含 high / low。
  */
-export function computePlan({ prevBar, fibBar, equity, available }) {
+export function computePlan({ prevBar, fibBar, entryPrice, stopPrice, equity, available }) {
+  // v4.1（2026-10-25）：進場與停損改由條件 3 明確指定 ——
+  //   進場＝3H 連續黑K 最後一根的開盤價、停損＝當前 3H K 棒的最低點。
+  //   斐波那契（條件 3 的黑K）仍留著，負責四段停利的價位。
+  if (entryPrice != null && stopPrice != null) {
+    const span = fibBar ? fibBar.high - fibBar.low : null;
+    const targetsExplicit = (span > 0)
+      ? FIB_TARGETS.map(lvl => ({ multiple: lvl, price: roundPrice(fibBar.low + lvl * span, fibBar.low) }))
+      : null;
+    return finishPlan({
+      entry: entryPrice, stop: stopPrice, targetPrices: targetsExplicit, equity, available,
+    });
+  }
+  return computePlanLegacy({ prevBar, fibBar, equity, available });
+}
+
+/** 舊的推導方式：有 fibBar 就用 0.7/0，否則用 prevBar 的高低點 */
+function computePlanLegacy({ prevBar, fibBar, equity, available }) {
   // v3（2026-10-25）：價格全部由條件 4 的黑K 拉斐波那契決定 ——
   //   1 = 黑K 高點、0 = 黑K 低點，進場在 0.7、停損在 0、
   //   停利四段分別在 10.8 / 20.8 / 30.8 / 50.8。
@@ -91,6 +108,11 @@ export function computePlan({ prevBar, fibBar, equity, available }) {
     stop = prevBar.low;
     targetPrices = null;
   }
+  return finishPlan({ entry, stop, targetPrices, equity, available });
+}
+
+/** 共用的收尾：R、風險檔、數量、保證金上限、各批數量 */
+function finishPlan({ entry, stop, targetPrices, equity, available }) {
   const R = entry - stop;
   if (!(R > 0)) return { ok: false, reason: `R 不是正數（進場 ${entry} 停損 ${stop}）` };
 
@@ -106,8 +128,10 @@ export function computePlan({ prevBar, fibBar, equity, available }) {
     capped = true;
   }
 
-  const targets = targetPrices
-    || TP_MULTIPLES.map(m => ({ multiple: m, price: roundPrice(entry + m * R, entry) }));
+  // 停利價必須都在進場之上，否則送單一定被拒
+  const targets = (targetPrices || TP_MULTIPLES.map(m => ({ multiple: m, price: roundPrice(entry + m * R, entry) })))
+    .filter(t => t.price > entry);
+  if (!targets.length) return { ok: false, reason: `所有停利價都不在進場價 ${entry} 之上` };
 
   const qtyEach = roundQty(qtyTotal / targets.length);
   if (qtyEach <= 0) return { ok: false, reason: `算出的數量是 0（風險 ${riskUSD} / R ${R}）` };
@@ -343,7 +367,7 @@ export async function trailStops() {
 }
 
 /** 給監控器用的一條龍：算計畫 → 下單 → 回傳可直接寫進通知的摘要 */
-export async function tradeSignal({ symbol, prevBar, fibBar = null, barTime, dryRun = false }) {
+export async function tradeSignal({ symbol, prevBar, fibBar = null, entryPrice = null, stopPrice = null, barTime, dryRun = false }) {
   if (alreadyTraded(symbol, barTime)) {
     return { skipped: true, reason: '這根 K 棒已經下過單' };
   }
@@ -377,7 +401,7 @@ export async function tradeSignal({ symbol, prevBar, fibBar = null, barTime, dry
     return { skipped: true, reason: `${base} 目前仍有未結部位或掛單（${clash}），不重複下` };
   }
 
-  const plan = computePlan({ prevBar, fibBar, equity: acct.equity, available: acct.available });
+  const plan = computePlan({ prevBar, fibBar, entryPrice, stopPrice, equity: acct.equity, available: acct.available });
   if (!plan.ok) return { ok: false, reason: plan.reason };
 
   const entry = await placeSignalOrders({ symbol, plan, barTime, dryRun });

@@ -563,6 +563,11 @@ async function checkEntry(tvSym) {
     const prev3h = bars3h[bars3h.length - 2];
     if (!isBullEngulf(curr3h, prev3h)) return null;
     const fibBar = { high: prev3h.high, low: prev3h.low, time: prev3h.time };
+    // 進場＝往前找連續收黑K 的最後一根的開盤價。紅吞的定義已要求前一根
+    // 是黑K，所以那一串連續黑K 的最後一根就是 prev3h。
+    const entryPrice = prev3h.open;
+    // 停損＝當前這根 3H 的最低點
+    const stopPrice = curr3h.low;
 
     // 條件4：1H 當前收盤高於前一根的實體上緣
     await switchTF('60');
@@ -575,7 +580,7 @@ async function checkEntry(tvSym) {
 
     // 進場與停損由條件 3 的黑K 拉斐波那契決定（0.7 進場、0 停損）
     return { symbol: tvSym, displayName, price: curr1h.close, barTime: curr1h.time,
-             d1Signal, d3Signal, h3Signal: '紅吞', h1Signal, fibBar,
+             d1Signal, d3Signal, h3Signal: '紅吞', h1Signal, fibBar, entryPrice, stopPrice,
              prevBar: { high: curr1h.high, low: curr1h.low, time: curr1h.time } };
   } catch (e) {
     // 單一幣對失敗不中斷整輪，但要記下來讓本輪摘要看得到，不靜默吞掉
@@ -687,7 +692,8 @@ async function runScan() {
           if (TRADING_ENABLED && result.prevBar) {
             try {
               trade = await tradeSignal({
-                symbol: tvSym, prevBar: result.prevBar, fibBar: result.fibBar, barTime: result.barTime,
+                symbol: tvSym, prevBar: result.prevBar, fibBar: result.fibBar,
+                entryPrice: result.entryPrice, stopPrice: result.stopPrice, barTime: result.barTime,
               });
               if (trade.skipped) {
                 console.log(`  ⏭ 不下單：${trade.reason}`);
