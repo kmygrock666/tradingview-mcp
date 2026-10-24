@@ -15,10 +15,10 @@
  *
  *   型態是「大週期轉弱、小週期洗盤，但關鍵低點沒破」的回踩買進。
  *
- * 極速匡移除條件（僅極速匡頁籤）── 目前【暫停中】，見 REMOVAL_ENABLED：
- *   3D 上漲結構被破壞 → 自清單移除並通知。
- *   往回找最後一次「紅吞」K棒（上漲趨勢的錨點），當前收盤跌破該根的
- *   最低價（含下影線）即成立。單純出現 3D 黑吞但沒收破紅吞低點不算。
+ * 極速匡移除條件（僅極速匡頁籤，見 REMOVAL_ENABLED）：
+ *   18D 當前 K棒為「黑吞」→ 自清單移除並通知。
+ *   18D 一根要 18 個交易日，訊號極少但份量重；新上市幣對常常沒有足夠的
+ *   18D 歷史，那種情況會回報讀取錯誤（進本輪摘要），不會當成「不用移除」。
  *
  * 自動下單（模擬交易「極速匡帳戶」，見 TRADING_ENABLED）：
  *   抓到進場信號就掛限價單 —— 進場＝1H 觸發那根（條件 4）的最高價，
@@ -67,7 +67,7 @@ const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
 // 換好之前就先更新，只能拿它當「已下指令」看，不能當「資料已就緒」用。
 const MAIN_SERIES = `${CHART_API}._chartWidget.model().mainSeries()`;
 // 各週期的 K 棒間距（秒），用來確認讀到的序列真的是這個週期
-const TF_SECONDS = { '60': 3600, '180': 10800, 'D': 86400, '3D': 259200 };
+const TF_SECONDS = { '60': 3600, '180': 10800, 'D': 86400, '3D': 259200, '18D': 1555200 };
 // 切換後的沉澱時間（ms）。資料是否就緒改由 waitForChart 輪詢判定，
 // 這裡只要讓 setSymbol/setResolution 有機會生效即可。
 const SYMBOL_WAIT = 150;
@@ -83,13 +83,14 @@ const MA_TIMEOUT_MS = 8000;
 // 心跳：距離上次「掃描完成」超過 間隔 + 寬限 仍沒完成，就發逾時告警。
 // 目的是讓「沒收到訊息」只剩一種解讀 —— 程式整個掛了。
 const HEARTBEAT_GRACE_MIN = 5;
-// 3D 移除檢查的總開關。false = 只做進場判斷，不從清單移除任何標的。
-// 2026-09-19 使用者要求暫停；要恢復就改回 true（或設環境變數 JSK_REMOVAL=on）。
+// 移除檢查的總開關。false = 只做進場判斷，不從清單移除任何標的。
+// 2026-09-19 暫停、2026-10-25 隨著條件改為 18D 黑吞一併恢復
+//（要再暫停就改回 false，或設環境變數 JSK_REMOVAL=off）。
 const REMOVAL_ENABLED = process.env.JSK_REMOVAL
   ? process.env.JSK_REMOVAL.toLowerCase() === 'on'
-  : false;
-// 3D 移除條件往回看的 K 棒數：要夠長才找得到當作上漲錨點的那根紅吞
-const REMOVAL_BARS_3D = 12;
+  : true;
+// 移除檢查要抓的 18D K 棒數（只需要當前與前一根，多抓一點確保間距對得上）
+const REMOVAL_BARS_18D = 4;
 // Telegram 發送逾時（ms）。Node fetch 預設不逾時，卡住會拖垮整輪。
 const TG_TIMEOUT_MS = 10000;
 // 自動下單總開關（模擬交易「極速匡帳戶」）。關掉就只發信號不下單。
@@ -472,26 +473,21 @@ async function fetchWatchlists(listNames) {
   return lists;
 }
 
-// ─── 檢查極速匡移除條件：3D 收破最後一次紅吞的最低價 ──────────
-async function checkRemoval3D(tvSym) {
+// ─── 檢查極速匡移除條件：18D 黑吞 ──────────
+// 2026-10-25 使用者改版：原本是「3D 收盤跌破最後一次紅吞的最低價」，
+// 現在改成最大週期的反轉訊號 —— 18D 當前 K 棒為黑吞就出清。
+// 18D 一根要 18 個交易日，訊號極少但份量重。
+async function checkRemoval18D(tvSym) {
   try {
-    await switchTo(tvSym, '3D');
-    // 最少 2 根即可：不足以構成錨點時會走 noAnchor（資料太短），
-    // 不該當成故障每輪報錯 —— 新上市幣對 3D 只有 1~2 根是常態。
-    const b = await waitForChart(tvSym, '3D', 2, REMOVAL_BARS_3D);
+    await switchTo(tvSym, '18D');
+    const b = await waitForChart(tvSym, '18D', 2, REMOVAL_BARS_18D);
     const curr = b[b.length - 1];
-    // 往回找最後一次紅吞（上漲趨勢的錨點），當前收盤跌破它的最低價
-    // （含下影線，不是實體低）就移除。從前一根起找：紅吞本身收盤必高於
-    // 開盤，不可能跌破自己的低點。
-    const anchorIdx = findLastBullEngulfIdx(b, b.length - 2);
-    // 找不到錨點（資料太短或近期無紅吞）不是「沒跌破」，要分得出來
-    if (anchorIdx < 0) return { noAnchor: true };
-    if (curr.close < b[anchorIdx].low) {
-      const anchor = b[anchorIdx];
+    const prev = b[b.length - 2];
+    if (isBearEngulf(curr, prev)) {
       // 附上判定依據的數字，讓通知可以直接被覆核，不必回頭開圖表對
       return {
-        reason: '3D跌破紅吞低',
-        detail: `${day(curr)} 收${curr.close}＜${day(anchor)} 紅吞低${anchor.low}`,
+        reason: '18D黑吞',
+        detail: `${day(curr)} 收${curr.close}＜前根實體低${Math.min(prev.open, prev.close)}`,
       };
     }
     return null;
@@ -642,9 +638,9 @@ async function runScan() {
         console.log('⏭ (其他清單已掃)');
         continue;
       }
-      // 移除條件僅適用極速匡：3D 收破最後一次紅吞的最低價 → 待移除，跳過進場檢查
+      // 移除條件僅適用極速匡：18D 黑吞 → 待移除，跳過進場檢查
       if (list === '極速匡' && REMOVAL_ENABLED) {
-        const removal = await checkRemoval3D(tvSym);
+        const removal = await checkRemoval18D(tvSym);
         if (removal?.error) {
           // 移除狀態不明時不做進場判斷：寧可這輪跳過，也不要對一個
           // 可能該被移除的標的發進場信號
@@ -652,10 +648,7 @@ async function runScan() {
           console.log(`⚠️  移除檢查失敗：${removal.error}`);
           continue;
         }
-        if (removal?.noAnchor) {
-          // 只印在 log，不進 TG：這是資料狀態，不是故障
-          process.stdout.write('（無紅吞錨點）');
-        } else if (removal) {
+        if (removal) {
           removals.push({ tvSym, displayName: label, ...removal });
           console.log(`🗑 ${removal.reason} → 待移除（${removal.detail}）`);
           continue;
