@@ -4,19 +4,30 @@
  *
  * 監控清單（TradingView watchlist 頁籤）：極速匡、加密貨幣
  *
- * 進場條件（2026-10-25 v4「破底後由黑轉紅」，做多，四項全部成立）：
+ * 進場條件（2026-10-25 v5，做多，兩組策略並行，先到先贏）：
+ *
+ * 【A：破底後由黑轉紅】
  *   1. 3D：連續收黑K 之後，當前出一根紅K
- *   2. 1D：連續收紅K 且收盤逐根遞增、其中某根的高點曾突破「7EMA_5MA」
- *      的 MA 1，之後當前出一根黑K
+ *   2. 1D：連續收紅K 且收盤逐根遞增、其中某根高點曾突破 MA 1，之後出一根黑K
  *   3. 3H：當前為「紅吞」，用它的前一根（黑K）拉斐波那契
- *      （1 = 黑K高點、0 = 黑K低點）← 進場與停損都由這根決定
  *   4. 1H：當前收盤高於前一根的實體上緣
+ *   進場＝3H 前一根（連續黑K 的最後一根）的開盤價，停損＝3H 當前 K 棒最低點
+ *
+ * 【B：突破後進場】
+ *   1. 3D：當前為「紅吞」
+ *   2. 1D：(當前紅吞 且 低點不低於前一根 且 高點過 MA 1) 或 (前 2 根以上皆為紅吞)
+ *   3. 3H：前一根收黑，且當前低點沒有跌破前一根的低點
+ *   4. 1H：當前為「紅吞」，用它的前一根（黑K）拉斐波那契
+ *   進場＝斐波那契 1（黑K 高點），停損＝斐波那契 0（黑K 低點）
+ *
+ *   兩組共用同一次圖表載入（分開跑會讓每輪時間加倍），A 先判、A 不過才判 B。
+ *   停利一律是斐波那契四段 10.8 / 20.8 / 30.8 / 50.8，各 1/4 部位。
  *
  *   吞噬定義（見 isBullEngulf/isBearEngulf）：
  *     紅吞＝當前漲過前一根「黑K」的高點且自身收紅
  *     黑吞＝當前跌破前一根「紅K」的低點且自身收黑
  *
- *   「連續」一律指 2 根以上。
+
  *
  * 極速匡移除條件（僅極速匡頁籤，見 REMOVAL_ENABLED）：
  *   18D 當前 K棒為「黑吞」→ 自清單移除並通知。
@@ -518,6 +529,102 @@ async function checkRemoval18D(tvSym) {
 }
 
 
+// ─── 兩組策略的判定（純函式，不碰圖表）────────────────────
+// 刻意不做 I/O：資料由呼叫端一次載入後傳進來，兩組共用，也才能單元測試。
+// 回傳 { ok:true, signal } 或 { ok:false, stage, why }。
+
+/** A：破底後由黑轉紅 */
+function evalStrategyA({ bars3d, barsD, maVal, bars3h, bars1h }) {
+  const curr3d = bars3d[bars3d.length - 1];
+  if (!(curr3d.close > curr3d.open)) return { ok: false, stage: '1', why: '當前3D不是紅K' };
+  let blackRun = 0;
+  for (let i = bars3d.length - 2; i >= 0; i--) {
+    if (bars3d[i].close < bars3d[i].open) blackRun++; else break;
+  }
+  if (blackRun < MIN_RUN) return { ok: false, stage: '1', why: `連續黑K只有 ${blackRun} 根` };
+
+  const currD = barsD[barsD.length - 1];
+  if (!(currD.close < currD.open)) return { ok: false, stage: '2', why: '當前1D不是黑K' };
+  const redRun = [];
+  for (let i = barsD.length - 2; i >= 0; i--) {
+    const b = barsD[i];
+    if (b.close > b.open) redRun.unshift(b); else break;
+  }
+  if (redRun.length < MIN_RUN) return { ok: false, stage: '2', why: `連續紅K只有 ${redRun.length} 根` };
+  for (let i = 1; i < redRun.length; i++) {
+    if (!(redRun[i].close > redRun[i - 1].close)) return { ok: false, stage: '2', why: '紅K收盤沒遞增' };
+  }
+  if (!redRun.some(b => b.high > maVal)) return { ok: false, stage: '2', why: '沒有任何紅K高點過MA' };
+
+  const curr3h = bars3h[bars3h.length - 1];
+  const prev3h = bars3h[bars3h.length - 2];
+  if (!isBullEngulf(curr3h, prev3h)) return { ok: false, stage: '3', why: '3H不是紅吞' };
+
+  const curr1h = bars1h[bars1h.length - 1];
+  const prev1h = bars1h[bars1h.length - 2];
+  const bodyTop = Math.max(prev1h.open, prev1h.close);
+  if (!(curr1h.close > bodyTop)) return { ok: false, stage: '4', why: '1H收盤沒過前根實體' };
+
+  return { ok: true, signal: {
+    strategy: 'A',
+    price: curr1h.close, barTime: curr1h.time,
+    d3Signal: `3D連${blackRun}黑轉紅`,
+    d1Signal: `1D連${redRun.length}紅遞增過MA(${maVal})後轉黑`,
+    h3Signal: '紅吞', h1Signal: `1H收${curr1h.close}過前根實體${bodyTop}`,
+    fibBar: { high: prev3h.high, low: prev3h.low, time: prev3h.time },
+    entryPrice: prev3h.open,     // 連續黑K 最後一根的開盤價
+    stopPrice: curr3h.low,       // 當前 3H 的最低點
+  } };
+}
+
+/** B：突破後進場 */
+function evalStrategyB({ bars3d, barsD, maVal, bars3h, bars1h }) {
+  const curr3d = bars3d[bars3d.length - 1];
+  const prev3d = bars3d[bars3d.length - 2];
+  if (!isBullEngulf(curr3d, prev3d)) return { ok: false, stage: '1', why: '3D不是紅吞' };
+
+  const currD = barsD[barsD.length - 1];
+  const prevD = barsD[barsD.length - 2];
+  // 型態 A：當前紅吞 + 低點不低於前一根 + 高點過 MA
+  const d1a = isBullEngulf(currD, prevD) && currD.low >= prevD.low && currD.high > maVal;
+  // 型態 B：前 2 根以上皆為紅吞
+  //
+  // 注意：新的吞噬定義要求「前一根是黑K」，而紅吞自身收紅 —— 兩根相鄰的
+  // 紅吞因此在邏輯上不可能同時成立（後者要求前者是黑K，但前者是紅K）。
+  // 這個分支照字面實作，永遠不會通過；若本意是「前 2 根以上皆為紅K」，
+  // 把 isBullEngulf 換成 close > open 即可。
+  let bullRun = 0;
+  for (let i = barsD.length - 2; i >= 1; i--) {
+    if (isBullEngulf(barsD[i], barsD[i - 1])) bullRun++; else break;
+  }
+  const d1b = bullRun >= MIN_RUN;
+  if (!d1a && !d1b) {
+    return { ok: false, stage: '2', why: isBullEngulf(currD, prevD)
+      ? (currD.low >= prevD.low ? '1D高點沒過MA' : '1D低點比前一根低')
+      : '1D不是紅吞且前面沒有連續紅吞' };
+  }
+
+  const curr3h = bars3h[bars3h.length - 1];
+  const prev3h = bars3h[bars3h.length - 2];
+  if (!(prev3h.close < prev3h.open)) return { ok: false, stage: '3', why: '3H前一根不是黑K' };
+  if (!(curr3h.low >= prev3h.low)) return { ok: false, stage: '3', why: '3H跌破前一根低點' };
+
+  const curr1h = bars1h[bars1h.length - 1];
+  const prev1h = bars1h[bars1h.length - 2];
+  if (!isBullEngulf(curr1h, prev1h)) return { ok: false, stage: '4', why: '1H不是紅吞' };
+
+  return { ok: true, signal: {
+    strategy: 'B',
+    price: curr1h.close, barTime: curr1h.time,
+    d3Signal: '3D紅吞',
+    d1Signal: d1a ? `1D紅吞不破前低且高點過MA(${maVal})` : `1D前${bullRun}根紅吞`,
+    h3Signal: '前根黑K且未破低', h1Signal: '1H紅吞',
+    fibBar: { high: prev1h.high, low: prev1h.low, time: prev1h.time },
+    entryPrice: prev1h.high,     // 斐波那契 1
+    stopPrice: prev1h.low,       // 斐波那契 0
+  } };
+}
+
 // 不通過時回報「卡在第幾關」，而不是單純的 null —— 一直盲調條件卻不知道
 // 瓶頸在哪，等於在猜。每輪會把統計印出來並帶進 TG 摘要。
 function rej(stage, why) { return { rejected: true, stage, why }; }
@@ -527,65 +634,25 @@ function rej(stage, why) { return { rejected: true, stage, why }; }
 async function checkEntry(tvSym) {
   const displayName = tvSym.split(':').pop().replace('.P', '');
   try {
-    // 條件1：3D 連續收黑K 之後，當前出一根紅K
+    // 四個週期各載入一次，兩組策略共用 —— 分開跑會讓每輪時間加倍
     await switchTo(tvSym, '3D');
     const bars3d = await waitForChart(tvSym, '3D', 4, 8);
-    const curr3d = bars3d[bars3d.length - 1];
-    if (!(curr3d.close > curr3d.open)) return rej('1', '當前3D不是紅K');
-    let blackRun = 0;
-    for (let i = bars3d.length - 2; i >= 0; i--) {
-      if (bars3d[i].close < bars3d[i].open) blackRun++;
-      else break;
-    }
-    if (blackRun < MIN_RUN) return rej('1', `連續黑K只有 ${blackRun} 根`);
-    const d3Signal = `3D連${blackRun}黑轉紅`;
-
-    // 條件2：1D 連續收紅K、收盤逐根遞增、其中某根高點過 MA 1，然後出一根黑K
     await switchTF('D');
     const barsD = await waitForChart(tvSym, 'D', 4, 12);
-    const currD = barsD[barsD.length - 1];
-    if (!(currD.close < currD.open)) return rej('2', '當前1D不是黑K');
-    const redRun = [];
-    for (let i = barsD.length - 2; i >= 0; i--) {
-      const b = barsD[i];
-      if (b.close > b.open) redRun.unshift(b);
-      else break;
-    }
-    if (redRun.length < MIN_RUN) return rej('2', `連續紅K只有 ${redRun.length} 根`);
-    for (let i = 1; i < redRun.length; i++) {
-      if (!(redRun[i].close > redRun[i - 1].close)) return rej('2', '紅K收盤沒遞增');
-    }
-    // MA 值必須在 1D 這個週期上讀；讀不到會丟錯，由本輪摘要回報
-    const maVal = await waitForMaValue();
-    if (!redRun.some(b => b.high > maVal)) return rej('2', '沒有任何紅K高點過MA');
-    const d1Signal = `1D連${redRun.length}紅遞增過MA(${maVal})後轉黑`;
-
-    // 條件3：3H 當前紅吞 —— 紅吞的定義已要求前一根是黑K，那根就是斐波那契錨點
+    const maVal = await waitForMaValue();   // MA 必須在 1D 上讀
     await switchTF('180');
     const bars3h = await waitForChart(tvSym, '180', 3, 6);
-    const curr3h = bars3h[bars3h.length - 1];
-    const prev3h = bars3h[bars3h.length - 2];
-    if (!isBullEngulf(curr3h, prev3h)) return rej('3', '3H不是紅吞');
-    const fibBar = { high: prev3h.high, low: prev3h.low, time: prev3h.time };
-    // 進場＝往前找連續收黑K 的最後一根的開盤價。紅吞的定義已要求前一根
-    // 是黑K，所以那一串連續黑K 的最後一根就是 prev3h。
-    const entryPrice = prev3h.open;
-    // 停損＝當前這根 3H 的最低點
-    const stopPrice = curr3h.low;
-
-    // 條件4：1H 當前收盤高於前一根的實體上緣
     await switchTF('60');
-    const bars1h = await waitForChart(tvSym, '60', 2, 4);
-    const curr1h = bars1h[bars1h.length - 1];
-    const prev1h = bars1h[bars1h.length - 2];
-    const prevBodyTop = Math.max(prev1h.open, prev1h.close);
-    if (!(curr1h.close > prevBodyTop)) return rej('4', '1H收盤沒過前根實體');
-    const h1Signal = `1H收${curr1h.close}過前根實體${prevBodyTop}`;
+    const bars1h = await waitForChart(tvSym, '60', 3, 4);
 
-    // 進場與停損由條件 3 的黑K 拉斐波那契決定（0.7 進場、0 停損）
-    return { symbol: tvSym, displayName, price: curr1h.close, barTime: curr1h.time,
-             d1Signal, d3Signal, h3Signal: '紅吞', h1Signal, fibBar, entryPrice, stopPrice,
-             prevBar: { high: curr1h.high, low: curr1h.low, time: curr1h.time } };
+    const data = { bars3d, barsD, maVal, bars3h, bars1h };
+    const a = evalStrategyA(data);
+    if (a.ok) return { symbol: tvSym, displayName, ...a.signal };
+    const b = evalStrategyB(data);
+    if (b.ok) return { symbol: tvSym, displayName, ...b.signal };
+
+    // 兩組都不過：兩邊的卡關原因都回報，統計才看得出各自的瓶頸
+    return { rejected: true, a: { stage: a.stage, why: a.why }, b: { stage: b.stage, why: b.why } };
   } catch (e) {
     // 單一幣對失敗不中斷整輪，但要記下來讓本輪摘要看得到，不靜默吞掉
     return { error: e.message || String(e) };
@@ -684,8 +751,10 @@ async function runScan() {
       scanned.add(tvSym);
       const result = await checkEntry(tvSym);
       if (result?.rejected) {
-        const key = `條件${result.stage}：${result.why}`;
-        rejections.set(key, (rejections.get(key) || 0) + 1);
+        for (const [tag, r] of [['A', result.a], ['B', result.b]]) {
+          const key = `${tag}條件${r.stage}：${r.why}`;
+          rejections.set(key, (rejections.get(key) || 0) + 1);
+        }
         console.log('—');
       } else if (result?.error) {
         errors.push(`${label}：${result.error}`);
@@ -702,7 +771,8 @@ async function runScan() {
             try {
               trade = await tradeSignal({
                 symbol: tvSym, prevBar: result.prevBar, fibBar: result.fibBar,
-                entryPrice: result.entryPrice, stopPrice: result.stopPrice, barTime: result.barTime,
+                entryPrice: result.entryPrice, stopPrice: result.stopPrice,
+                variant: result.strategy, barTime: result.barTime,
               });
               if (trade.skipped) {
                 console.log(`  ⏭ 不下單：${trade.reason}`);
@@ -768,7 +838,7 @@ async function runScan() {
     for (const s of signals) {
       const lines = [
         `${s.displayName}  @${s.price}`,
-        `${s.d3Signal} + ${s.d1Signal} + 3H${s.h3Signal} + ${s.h1Signal}`,
+        `［策略${s.strategy}］${s.d3Signal} + ${s.d1Signal} + 3H${s.h3Signal} + ${s.h1Signal}`,
         `斐波那契錨點：黑K 高${s.fibBar.high} 低${s.fibBar.low}`,
       ];
       if (s.trade?.ok) {

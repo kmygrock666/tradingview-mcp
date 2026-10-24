@@ -18,7 +18,7 @@ import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicke
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const JOURNAL = path.join(ROOT, 'trades-jskuang.jsonl');
 
-export const STRATEGY_VERSION = 'v4.1';  // 進場條件版本，寫進帳本方便分開統計
+export const STRATEGY_VERSION = 'v5';  // 進場條件版本，寫進帳本方便分開統計
 export const RISK_PCT = 0.02;          // 單筆風險 = 權益的 2%
 export const TP_MULTIPLES = [5, 10];   // 舊版（v2）的 R 倍數停利，fibBar 缺席時的後備
 // ── v3 斐波那契定價（使用者 2026-10-25）──────────────────
@@ -170,7 +170,7 @@ export function alreadyTraded(symbol, barTime) {
  * 兩個停利在合併時會消失，只剩一個涵蓋全部數量的停損 —— 分批停利等於沒做
  * （2026-10-16 實測 ETH：0.559 的部位只剩 SL）。
  */
-export async function placeSignalOrders({ symbol, plan, barTime, dryRun = false }) {
+export async function placeSignalOrders({ symbol, plan, barTime, variant = null, dryRun = false }) {
   const exits = plan.targets.map(t => ({ qty: plan.qtyEach, tp: t.price }));
   const r = await placeLimitBracket({
     symbol,
@@ -203,7 +203,7 @@ export async function placeSignalOrders({ symbol, plan, barTime, dryRun = false 
     targets: plan.targets, qtyEach: plan.qtyEach, qtyTotal: plan.qtyTotal,
     riskUSD: plan.riskUSD, actualRiskUSD: plan.actualRiskUSD, equity: plan.equity,
     riskPct: plan.riskPct, drawdown: plan.drawdown, riskReduced: plan.riskReduced,
-    capped: plan.capped, dryRun, strategy: STRATEGY_VERSION,
+    capped: plan.capped, dryRun, strategy: STRATEGY_VERSION, variant,
     orders: results, orderIds,
     status: results.some(r => r.ok) ? 'placed' : 'failed',
   };
@@ -367,7 +367,7 @@ export async function trailStops() {
 }
 
 /** 給監控器用的一條龍：算計畫 → 下單 → 回傳可直接寫進通知的摘要 */
-export async function tradeSignal({ symbol, prevBar, fibBar = null, entryPrice = null, stopPrice = null, barTime, dryRun = false }) {
+export async function tradeSignal({ symbol, prevBar, fibBar = null, entryPrice = null, stopPrice = null, barTime, variant = null, dryRun = false }) {
   if (alreadyTraded(symbol, barTime)) {
     return { skipped: true, reason: '這根 K 棒已經下過單' };
   }
@@ -404,6 +404,6 @@ export async function tradeSignal({ symbol, prevBar, fibBar = null, entryPrice =
   const plan = computePlan({ prevBar, fibBar, entryPrice, stopPrice, equity: acct.equity, available: acct.available });
   if (!plan.ok) return { ok: false, reason: plan.reason };
 
-  const entry = await placeSignalOrders({ symbol, plan, barTime, dryRun });
+  const entry = await placeSignalOrders({ symbol, plan, barTime, variant, dryRun });
   return { ok: entry.status === 'placed', plan, entry };
 }
