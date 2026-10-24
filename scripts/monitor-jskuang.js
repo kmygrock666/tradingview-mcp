@@ -61,6 +61,7 @@ import { connect, disconnect, evaluate, evaluateAsync, getTargetInfo } from '../
 import { getOhlcv, getStudyValues } from '../src/core/data.js';
 import { removeFromList } from '../src/core/watchlist.js';
 import { tradeSignal, expireStaleOrders, trailStops, ORDER_TTL_MS, DRAWDOWN_TRIGGER, RISK_PCT_REDUCED } from './lib/jsk-trade.js';
+import { drawEntryFib } from './lib/fib-draw.js';
 
 // 自動載入專案根目錄的 .env(已用 export 設定或檔案不存在時略過)
 try { process.loadEnvFile(new URL('../.env', import.meta.url)); } catch {}
@@ -789,6 +790,14 @@ async function runScan() {
                 console.log(`  💰 已下單：進場 ${p2.entry} 停損 ${p2.stop} 數量 ${p2.qtyEach}×2 ` +
                   `風險 ${p2.actualRiskUSD} USD（${(p2.riskPct * 100).toFixed(2)}%` +
                   `${p2.riskReduced ? `，回撤 ${(p2.drawdown * 100).toFixed(1)}% 已降風險` : ''}）`);
+                // 把這筆單的斐波那契畫到圖上。要趁現在 —— 圖表還停在這個標的，
+                // 迴圈往下走就被切走了。畫失敗不影響這筆單，只記一行。
+                if (result.fibBar) {
+                  const fib = await drawEntryFib({
+                    fibBar: result.fibBar, targets: p2.targets, tag: result.displayName,
+                  });
+                  console.log(fib.ok ? `  📐 已畫斐波那契（${fib.id}）` : `  ⚠️  斐波那契沒畫成：${fib.reason}`);
+                }
               } else {
                 console.warn(`  ⚠️  下單失敗：${trade.reason || trade.entry?.orders?.map(o => o.step + ':' + o.detail).join('；')}`);
               }
