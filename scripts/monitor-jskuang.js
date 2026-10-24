@@ -6,11 +6,11 @@
  *
  * 進場條件（2026-10-25 v5，做多，兩組策略並行，先到先贏）：
  *
- * 【A：破底後由黑轉紅】
+ * 【A：回檔不破後由黑轉紅】
  *   1. 3D：最近 5 根內曾「連續收黑K 之後出一根紅K」（轉紅那根不必是當前這根）
  *   2. 1D：最近 10 根內曾「連續收紅K 且收盤逐根遞增、其中某根高點突破 MA 1，
- *      之後出一根黑K」，且後續有跌破那根黑K 的低點（破底）
- *   3. 3H：當前為「紅吞」，用它的前一根（黑K）拉斐波那契
+ *      之後出一根黑K」，且後續「未曾」跌破那根黑K 的低點
+ *   3. 3H：當前為「紅吞」或前一根收黑K（擇一），用前一根拉斐波那契
  *   4. 1H：當前收盤高於前一根的實體上緣
  *   進場＝3H 前一根（連續黑K 的最後一根）的開盤價，停損＝3H 當前 K 棒最低點
  *
@@ -180,21 +180,25 @@ function findBlackToRed(bars, lookback) {
 }
 
 // 在最近 lookback 根裡找策略A 條件2 的型態：
-//   連續收紅K（收盤遞增、其中某根高點過 MA）→ 出一根黑K → 後續跌破那根黑K 的低點
-// 黑K 不必是當前這根（也不可能是：還需要後面的 K 棒去跌破它）。
+//   連續收紅K（收盤遞增、其中某根高點過 MA）→ 出一根黑K → 後續「未曾」跌破那根黑K 的低點
+//
+// 最後一步是「守住」不是「跌破」：那根黑K 是上升段裡的回檔，低點沒被破代表
+// 回檔還在控制中，條件3 的紅吞才是接著進場的訊號。
+// （2026-10-24 曾短暫實作成「後續有跌破」，與此相反，見 git 紀錄。）
+//
+// 黑K 可以是當前這根 —— 剛回檔、還沒有後續 K 棒去破它，本來就算守住。
 // 回傳最近成立的一組；不成立時 why 取「最近一根黑K 候選」卡在哪，卡關統計才有意義。
 //
 // 注意：maVal 是「現在」的 MA 值，拿去比對可能是好幾天前的紅K 高點。
 // 資料視窗只給得到當下的指標值，要精確就得另外抓 MA 的歷史序列。
-function findRedRunThenBreak(bars, maVal, lookback) {
+function findRedRunThenHold(bars, maVal, lookback) {
   const start = Math.max(1, bars.length - lookback);
   // why 給人看（帶實際數字），whyKey 給卡關統計用（同類要能累加，不能把價格
   // 寫進去 —— 每個標的的價格都不一樣，統計就會變成一堆 ×1 的單筆）。
   // 只記「最近那根黑K 候選」卡在哪；再往回的候選不覆寫它。
   let why = null, whyKey = null;
   const note = (msg, key) => { if (why === null) { why = msg; whyKey = key || msg; } };
-  // 從倒數第二根起往回找：最後一根當黑K 的話，後面沒有 K 棒可以跌破它
-  for (let k = bars.length - 2; k >= start; k--) {
+  for (let k = bars.length - 1; k >= start; k--) {
     const black = bars[k];
     if (!(black.close < black.open)) continue;
 
@@ -216,10 +220,13 @@ function findRedRunThenBreak(bars, maVal, lookback) {
     for (let j = k + 1; j < bars.length; j++) {
       if (bars[j].low < black.low) { brokenIdx = j; break; }
     }
-    if (brokenIdx < 0) { note(`後續沒跌破黑K低點 ${black.low}`, '後續沒跌破黑K低點'); continue; }
+    if (brokenIdx >= 0) {
+      note(`後續跌破黑K低點 ${black.low}（${bars.length - 1 - brokenIdx}根前）`, '後續跌破黑K低點');
+      continue;
+    }
 
-    return { ok: true, redRun, black, blackIdx: k, brokenIdx,
-             agoBars: bars.length - 1 - k, brokenAgo: bars.length - 1 - brokenIdx };
+    return { ok: true, redRun, black, blackIdx: k,
+             agoBars: bars.length - 1 - k, heldBars: bars.length - 1 - k };
   }
   const fallback = `前${lookback}根內沒有黑K`;
   return { ok: false, why: why || fallback, whyKey: whyKey || fallback };
@@ -619,17 +626,21 @@ function evalStrategyA({ bars3d, barsD, maVal, bars3h, bars1h }) {
   }
   const { blackRun, agoBars } = found;
 
-  // 「曾連續收紅K、收盤遞增、某根高點過 MA 1，之後出一根黑K，後續跌破這根
-  // 黑K 的低點」。跟條件1 一樣用「曾」：黑K 不必是當前這根 —— 它本來就不可能
-  // 是，因為還要有後面的 K 棒去跌破它的低點。這個「破底」就是策略A 名字裡的
-  // 破底，條件3 的由黑轉紅才是接在它後面的反轉。
-  const d1 = findRedRunThenBreak(barsD, maVal, LOOKBACK_1D);
+  // 「曾連續收紅K、收盤遞增、某根高點過 MA 1，之後出一根黑K，後續未曾跌破
+  // 這根黑K 的低點」。跟條件1 一樣用「曾」：黑K 不必是當前這根。
+  // 低點守住＝上升段的回檔還在控制中，條件3 的紅吞才是接著進場的訊號。
+  const d1 = findRedRunThenHold(barsD, maVal, LOOKBACK_1D);
   if (!d1.ok) return { ok: false, stage: '2', why: d1.why, whyKey: d1.whyKey };
-  const { redRun, black: blackD, agoBars: blackAgo, brokenAgo } = d1;
+  const { redRun, black: blackD, agoBars: blackAgo } = d1;
 
+  // 當前紅吞 或 前一根收黑K，兩者擇一；斐波那契一律錨在前一根（1=高、0=低）
   const curr3h = bars3h[bars3h.length - 1];
   const prev3h = bars3h[bars3h.length - 2];
-  if (!isBullEngulf(curr3h, prev3h)) return { ok: false, stage: '3', why: '3H不是紅吞' };
+  const engulf3h = isBullEngulf(curr3h, prev3h);
+  const prevBlack3h = prev3h.close < prev3h.open;
+  if (!engulf3h && !prevBlack3h) {
+    return { ok: false, stage: '3', why: '3H既不是紅吞、前一根也不是黑K' };
+  }
 
   const curr1h = bars1h[bars1h.length - 1];
   const prev1h = bars1h[bars1h.length - 2];
@@ -640,8 +651,8 @@ function evalStrategyA({ bars3d, barsD, maVal, bars3h, bars1h }) {
     strategy: 'A',
     price: curr1h.close, barTime: curr1h.time,
     d3Signal: agoBars === 0 ? `3D連${blackRun}黑轉紅` : `3D連${blackRun}黑轉紅（${agoBars}根前）`,
-    d1Signal: `1D連${redRun.length}紅遞增過MA(${maVal})後轉黑（${blackAgo}根前，低${blackD.low}），${brokenAgo}根前破底`,
-    h3Signal: '紅吞', h1Signal: `1H收${curr1h.close}過前根實體${bodyTop}`,
+    d1Signal: `1D連${redRun.length}紅遞增過MA(${maVal})後轉黑（${blackAgo}根前，低${blackD.low}未破）`,
+    h3Signal: engulf3h ? '紅吞' : '前根收黑', h1Signal: `1H收${curr1h.close}過前根實體${bodyTop}`,
     fibBar: { high: prev3h.high, low: prev3h.low, time: prev3h.time },
     entryPrice: prev3h.open,     // 連續黑K 最後一根的開盤價
     stopPrice: curr3h.low,       // 當前 3H 的最低點

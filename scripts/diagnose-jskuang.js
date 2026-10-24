@@ -33,12 +33,12 @@ const grab = (name) => {
   return src.slice(i, src.indexOf('\n}', i) + 2);
 };
 // findBlackToRed 用到 MIN_RUN，當參數餵進沙箱，不要在這裡另寫一份判定
-const { isBullEngulf, findBlackToRed, findRedRunThenBreak } = new Function('MIN_RUN', `
+const { isBullEngulf, findBlackToRed, findRedRunThenHold } = new Function('MIN_RUN', `
 ${grab('isBullEngulf')}
 ${grab('isBearEngulf')}
 ${grab('findBlackToRed')}
-${grab('findRedRunThenBreak')}
-return { isBullEngulf, isBearEngulf, findBlackToRed, findRedRunThenBreak };`)(MIN_RUN);
+${grab('findRedRunThenHold')}
+return { isBullEngulf, isBearEngulf, findBlackToRed, findRedRunThenHold };`)(MIN_RUN);
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -101,33 +101,35 @@ async function main() {
     console.log(`         缺：視窗內每一根紅K 前面的連續黑K 都不足 ${MIN_RUN} 根，或視窗內根本沒有紅K`);
   }
 
-  // ── 條件2：1D 連續紅K 遞增、某根過 MA，出黑K，後續跌破那根黑K 低點 ──
+  // ── 條件2：1D 連續紅K 遞增、某根過 MA，出黑K，後續未曾跌破那根黑K 低點 ──
   const barsD = await loadBars(symbol, 'D', 20);
   const ma = await readMa();
   const currD = barsD[barsD.length - 1];
-  const d1 = findRedRunThenBreak(barsD, ma, LOOKBACK_1D);
+  const d1 = findRedRunThenHold(barsD, ma, LOOKBACK_1D);
   const c2 = d1.ok;
   if (c2) passed++;
-  console.log(`\n${mark(c2)} 條件2  最近 ${LOOKBACK_1D} 根 1D 內曾連續紅K 遞增且某根高點過 MA 後出黑K，且後續破底`);
+  console.log(`\n${mark(c2)} 條件2  最近 ${LOOKBACK_1D} 根 1D 內曾連續紅K 遞增且某根高點過 MA 後出黑K，且後續未曾跌破它的低點`);
   console.log(`         最近 ${barsD.length} 根 1D：${barsD.slice(-10).map(color).join(' ')}`);
   console.log(`         當前 開${currD.open} 收${currD.close}（${color(currD)}K）　MA 1 = ${Number.isFinite(ma) ? ma : '讀不到'}`);
   if (c2) {
     console.log(`         連續紅K ${d1.redRun.length} 根：收盤 ${d1.redRun.map(b => b.close).join(' → ')}（最高 ${Math.max(...d1.redRun.map(b => b.high))} > MA）`);
-    console.log(`         黑K 在 ${d1.agoBars} 根前（開${d1.black.open} 收${d1.black.close} 低${d1.black.low}），${d1.brokenAgo} 根前跌破它的低點`);
+    console.log(`         黑K 在 ${d1.agoBars} 根前（開${d1.black.open} 收${d1.black.close} 低${d1.black.low}），之後 ${d1.heldBars} 根都沒跌破它的低點`);
   } else {
     console.log(`         缺：${d1.why}（回報的是視窗內最近一根黑K 候選卡在哪）`);
   }
 
-  // ── 條件3：3H 當前紅吞 ──
+  // ── 條件3：3H 當前紅吞 或 前一根收黑K ──
   const bars3h = await loadBars(symbol, '180', 6);
   const curr3h = bars3h[bars3h.length - 1];
   const prev3h = bars3h[bars3h.length - 2];
-  const c3 = isBullEngulf(curr3h, prev3h);
+  const engulf3h = isBullEngulf(curr3h, prev3h);
+  const prevBlack3h = prev3h.close < prev3h.open;
+  const c3 = engulf3h || prevBlack3h;
   if (c3) passed++;
-  console.log(`\n${mark(c3)} 條件3  3H 當前紅吞（高點過前一根、自身收紅；不限前一根顏色）`);
+  console.log(`\n${mark(c3)} 條件3  3H 當前紅吞 或 前一根收黑K（擇一即可）`);
   console.log(`         前一根 開${prev3h.open} 高${prev3h.high} 低${prev3h.low} 收${prev3h.close}（${color(prev3h)}K）`);
   console.log(`         當前   開${curr3h.open} 高${curr3h.high} 低${curr3h.low} 收${curr3h.close}（${color(curr3h)}K）`);
-  console.log(`         高點過前根 ${mark(curr3h.high > prev3h.high)}　自身收紅 ${mark(curr3h.close > curr3h.open)}`);
+  console.log(`         當前紅吞 ${mark(engulf3h)}（高點過前根 ${mark(curr3h.high > prev3h.high)}　自身收紅 ${mark(curr3h.close > curr3h.open)}）　或　前一根收黑K ${mark(prevBlack3h)}`);
   if (c3) {
     console.log(`         → 進場 ${prev3h.open}（前根開盤）　停損 ${curr3h.low}（當前低點）`);
   }
