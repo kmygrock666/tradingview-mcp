@@ -63,10 +63,22 @@ function roundQty(q) {
   return Math.round(q * 1e6) / 1e6;
 }
 
-/** 價格小數位比照進場價，避免 0.1 + 5*0.01 = 0.15000000000000002 */
-function roundPrice(p, ref) {
-  const decimals = (String(ref).split('.')[1] || '').length || 8;
-  return +p.toFixed(Math.min(decimals + 2, 10));
+/**
+ * 價格小數位比照同一商品的參考價，避免 0.1 + 5*0.01 = 0.15000000000000002。
+ *
+ * 位數只能「不超過」參考價，絕對不能加寬：參考價是這個商品的真實報價，
+ * 它的位數就是商品精度的上限。之前這裡寫 decimals + 2，算出的停利
+ * 0.258762（6 位）送進只吃 5 位的 ORDERUSDT，TradingView 自己截成
+ * 0.25876，讀回驗證就永遠對不上、整張單卡死。位數取少不會出事 ——
+ * 粗格上的價格一定也落在細格上。
+ * 多個參考價時取最寬的那個，停利才不會被不必要地截粗。
+ */
+function roundPrice(p, ...refs) {
+  // 整數報價（BTC 110000）就是 0 位，不能像以前那樣退回 8 位 —— 同樣會被截
+  const decimals = Math.max(0, ...refs
+    .filter(r => r != null && isFinite(r))
+    .map(r => (String(r).split('.')[1] || '').length));
+  return +p.toFixed(Math.min(decimals, 10));
 }
 
 /**
@@ -80,7 +92,8 @@ export function computePlan({ prevBar, fibBar, entryPrice, stopPrice, equity, av
   if (entryPrice != null && stopPrice != null) {
     const span = fibBar ? fibBar.high - fibBar.low : null;
     const targetsExplicit = (span > 0)
-      ? FIB_TARGETS.map(lvl => ({ multiple: lvl, price: roundPrice(fibBar.low + lvl * span, fibBar.low) }))
+      ? FIB_TARGETS.map(lvl => ({ multiple: lvl,
+          price: roundPrice(fibBar.low + lvl * span, fibBar.low, fibBar.high, entryPrice, stopPrice) }))
       : null;
     return finishPlan({
       entry: entryPrice, stop: stopPrice, targetPrices: targetsExplicit, equity, available,
@@ -99,7 +112,7 @@ function computePlanLegacy({ prevBar, fibBar, equity, available }) {
   if (fibBar) {
     const span = fibBar.high - fibBar.low;
     if (!(span > 0)) return { ok: false, reason: `斐波那契區間不是正數（高 ${fibBar.high} 低 ${fibBar.low}）` };
-    const at = (lvl) => roundPrice(fibBar.low + lvl * span, fibBar.low);
+    const at = (lvl) => roundPrice(fibBar.low + lvl * span, fibBar.low, fibBar.high);
     entry = at(FIB_ENTRY);
     stop = at(0);
     targetPrices = FIB_TARGETS.map(lvl => ({ multiple: lvl, price: at(lvl) }));

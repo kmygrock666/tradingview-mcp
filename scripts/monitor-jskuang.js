@@ -16,7 +16,8 @@
  * 【B：突破後進場】
  *   1. 3D：當前為「紅吞」
  *   2. 1D：(當前紅吞 且 低點不低於前一根 且 高點過 MA 1) 或 (前 2 根以上皆為紅吞)
- *   3. 3H：前一根收黑，且當前低點沒有跌破前一根的低點
+ *   3. 3H：當前不限型態（紅吞／收黑／收紅皆可），但低點不得跌破「前面
+ *      最近一根紅吞」的低點
  *   4. 1H：當前為「紅吞」，用它的前一根（黑K）拉斐波那契
  *   進場＝斐波那契 1（黑K 高點），停損＝斐波那契 0（黑K 低點）
  *
@@ -602,9 +603,13 @@ function evalStrategyB({ bars3d, barsD, maVal, bars3h, bars1h }) {
   }
 
   const curr3h = bars3h[bars3h.length - 1];
-  const prev3h = bars3h[bars3h.length - 2];
-  if (!(prev3h.close < prev3h.open)) return { ok: false, stage: '3', why: '3H前一根不是黑K' };
-  if (!(curr3h.low >= prev3h.low)) return { ok: false, stage: '3', why: '3H跌破前一根低點' };
+  // 當前這根是紅吞／收黑／收紅都可以（三者涵蓋所有 K 棒，等於不限型態），
+  // 真正的要求只有一個：不能跌破「前面那根紅吞」的低點 —— 那根紅吞是突破
+  // 結構的錨點，低點被破就代表突破失敗。
+  const anchorIdx3h = findLastBullEngulfIdx(bars3h, bars3h.length - 2);
+  if (anchorIdx3h < 0) return { ok: false, stage: '3', why: `3H前面${bars3h.length - 1}根內沒有紅吞` };
+  const anchor3h = bars3h[anchorIdx3h];
+  if (!(curr3h.low >= anchor3h.low)) return { ok: false, stage: '3', why: '3H跌破前面紅吞的低點' };
 
   const curr1h = bars1h[bars1h.length - 1];
   const prev1h = bars1h[bars1h.length - 2];
@@ -615,7 +620,7 @@ function evalStrategyB({ bars3d, barsD, maVal, bars3h, bars1h }) {
     price: curr1h.close, barTime: curr1h.time,
     d3Signal: '3D紅吞',
     d1Signal: d1a ? `1D紅吞不破前低且高點過MA(${maVal})` : `1D前${bullRun}根紅吞`,
-    h3Signal: '前根黑K且未破低', h1Signal: '1H紅吞',
+    h3Signal: `未破前面紅吞低點(${anchor3h.low})`, h1Signal: '1H紅吞',
     fibBar: { high: prev1h.high, low: prev1h.low, time: prev1h.time },
     entryPrice: prev1h.high,     // 斐波那契 1
     stopPrice: prev1h.low,       // 斐波那契 0
@@ -638,7 +643,8 @@ async function checkEntry(tvSym) {
     const barsD = await waitForChart(tvSym, 'D', 4, 12);
     const maVal = await waitForMaValue();   // MA 必須在 1D 上讀
     await switchTF('180');
-    const bars3h = await waitForChart(tvSym, '180', 3, 6);
+    // 策略B 條件3 要往回找「前面那根紅吞」，窗口太短會找不到而誤判，多抓一些
+    const bars3h = await waitForChart(tvSym, '180', 3, 12);
     await switchTF('60');
     const bars1h = await waitForChart(tvSym, '60', 3, 4);
 
@@ -764,10 +770,15 @@ async function runScan() {
           // 下單要在這裡做：圖表現在還停在這個標的上，
           // 迴圈一往下走就會被切到下一個，訂單視窗會跟著換商品。
           let trade = null;
-          if (TRADING_ENABLED && result.prevBar) {
+          // 兩組策略都明確給出 entryPrice / stopPrice，缺了就是判定端的 bug ——
+          // 要吵出來，不能像之前那樣悄悄跳過下單（信號照發、單卻沒下）。
+          if (TRADING_ENABLED && (result.entryPrice == null || result.stopPrice == null)) {
+            trade = { ok: false, reason: '信號沒帶進場價或停損價' };
+            console.warn('  ⚠️  下單失敗：信號沒帶進場價或停損價');
+          } else if (TRADING_ENABLED) {
             try {
               trade = await tradeSignal({
-                symbol: tvSym, prevBar: result.prevBar, fibBar: result.fibBar,
+                symbol: tvSym, fibBar: result.fibBar,
                 entryPrice: result.entryPrice, stopPrice: result.stopPrice,
                 variant: result.strategy, barTime: result.barTime,
               });
