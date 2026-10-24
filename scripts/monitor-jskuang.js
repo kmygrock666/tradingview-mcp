@@ -24,8 +24,9 @@
  *   停利一律是斐波那契四段 10.8 / 20.8 / 30.8 / 50.8，各 1/4 部位。
  *
  *   吞噬定義（見 isBullEngulf/isBearEngulf）：
- *     紅吞＝當前漲過前一根「黑K」的高點且自身收紅
- *     黑吞＝當前跌破前一根「紅K」的低點且自身收黑
+ *     紅吞＝當前漲過前一根的高點且自身收紅
+ *     黑吞＝當前跌破前一根的低點且自身收黑
+ *     （不限定前一根的顏色）
  *
 
  *
@@ -128,19 +129,18 @@ const removeNotified = new Set();
 // 紅吞：當前 K 棒漲過「前一根黑K」的高點，且自身收紅。
 // 黑吞：當前 K 棒跌破「前一根紅K」的低點，且自身收黑。
 //
-// 與舊定義的三個差異，改條件時要記得：
-//   1. 比的是「高低點」（含影線），不是收盤價。
-//   2. 比的是前一根的「高／低點」，不是實體邊界。
-//   3. 前一根的顏色是必要條件 —— 紅吞的前一根必須是黑K，黑吞的前一根
-//      必須是紅K。所以連續同色的 K 棒不會構成吞噬。
+// 與更舊的版本相比，比的是「高低點」（含影線）而不是收盤價，也不是實體邊界。
+//
+// 2026-10-25 修正：原本還多要求「前一根必須是黑K／紅K」，那是把使用者原話
+// 裡的「前根黑K」讀成了限制。實際上那只是描述典型情況 —— ERAUSDT 的 3D
+// 前一根是紅K、當前高點 0.10182 過了前根的 0.08325 且收紅，使用者認定那
+// 就是紅吞。拿掉顏色限制後，「連續紅吞」也才可能成立（B 的條件 2 用得到）。
 function isBullEngulf(c, p) {
-  return p.close < p.open      // 前一根是黑K
-    && c.high > p.high         // 當前有漲過它的高點
+  return c.high > p.high       // 當前有漲過前一根的高點
     && c.close > c.open;       // 當前自身收紅
 }
 function isBearEngulf(c, p) {
-  return p.close > p.open      // 前一根是紅K
-    && c.low < p.low           // 當前有跌破它的低點
+  return c.low < p.low         // 當前有跌破前一根的低點
     && c.close < c.open;       // 當前自身收黑
 }
 
@@ -587,12 +587,9 @@ function evalStrategyB({ bars3d, barsD, maVal, bars3h, bars1h }) {
   const prevD = barsD[barsD.length - 2];
   // 型態 A：當前紅吞 + 低點不低於前一根 + 高點過 MA
   const d1a = isBullEngulf(currD, prevD) && currD.low >= prevD.low && currD.high > maVal;
-  // 型態 B：前 2 根以上皆為紅吞
-  //
-  // 注意：新的吞噬定義要求「前一根是黑K」，而紅吞自身收紅 —— 兩根相鄰的
-  // 紅吞因此在邏輯上不可能同時成立（後者要求前者是黑K，但前者是紅K）。
-  // 這個分支照字面實作，永遠不會通過；若本意是「前 2 根以上皆為紅K」，
-  // 把 isBullEngulf 換成 close > open 即可。
+  // 型態 B：前 2 根以上皆為紅吞。
+  // 拿掉吞噬的顏色限制之後這個分支才可能成立 —— 先前要求「前一根是黑K」時，
+  // 兩根相鄰的紅吞在邏輯上互相矛盾，這條路永遠走不到。
   let bullRun = 0;
   for (let i = barsD.length - 2; i >= 1; i--) {
     if (isBullEngulf(barsD[i], barsD[i - 1])) bullRun++; else break;
