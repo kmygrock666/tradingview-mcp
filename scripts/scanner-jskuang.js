@@ -2,11 +2,13 @@
 /**
  * 極速匡策略掃描器
  *
- * 策略條件（全部需同時成立）：
- *   18D 紅吞 + 3D 紅吞 + 1D 紅吞 + 3H (紅吞 or 黑吞)
+ * 策略條件（2026-10-25 改版，只有一條）：
+ *   上一根（已完成）的 18D 為黑K，且現價已經突破該根的開盤價
+ *   —— 也就是完全收復那根 18D 黑K 的實體。
  *
- * 紅吞：當前紅K實體棒最高點(close) > 前一根K棒實體棒最高點(max(o,c))
- * 黑吞：當前黑K實體棒最低點(close) < 前一根K棒實體棒最低點(min(o,c))
+ * 黑K 的實體上緣就是開盤價（收盤 < 開盤），所以「過實體」＝現價 > 開盤價。
+ * 看的是「上一根」而非當前這根：當前 18D 還在走，型態隨時會變。
+ * 這條與監控器的移除條件（18D 黑吞出清）剛好成對：跌破出清、收復找回來。
  *
  * 只收 BINGX 永續合約，符合的幣對透過 REST 指名加入「極速匡」清單
  * （與目前開啟的頁籤無關，清單中已有的會被略過）。
@@ -48,32 +50,23 @@ const TF_WAIT = 100;
 const POLL_INTERVAL = 200;
 const LOAD_TIMEOUT = 8000;
 
-const TIMEFRAMES = [
-  { tf: '18D', label: '18D', signal: 'bull' },
-  { tf: '3D',  label: '3D',  signal: 'bull' },
-  { tf: 'D',   label: '1D',  signal: 'bull' },
-  { tf: '180', label: '3H',  signal: 'both' },
-];
+// 只剩 18D 一個週期要檢查（原本是 18D/3D/1D/3H 四關）
+const SCAN_TF = '18D';
 
-// 紅吞：紅K且收盤突破前棒實體最高點
-function isBullEngulf(curr, prev) {
-  return curr.close > curr.open
-    && curr.close > Math.max(prev.open, prev.close);
-}
-
-// 黑吞：黑K且收盤跌破前棒實體最低點
-function isBearEngulf(curr, prev) {
-  return curr.close < curr.open
-    && curr.close < Math.min(prev.open, prev.close);
-}
-
-function checkSignal(bars, signal) {
-  if (bars.length < 2) return false;
-  const curr = bars[bars.length - 1];
-  const prev = bars[bars.length - 2];
-  if (signal === 'bull') return isBullEngulf(curr, prev);
-  if (signal === 'both') return isBullEngulf(curr, prev) || isBearEngulf(curr, prev);
-  return false;
+/**
+ * 上一根 18D 是黑K，且現價過了它的實體上緣（開盤價）。
+ * 回傳 { pass, failedAt?, detail? }，detail 讓通知可以直接被覆核。
+ */
+function checkReclaim(bars) {
+  if (bars.length < 2) return { pass: false, failedAt: '資料不足' };
+  const prev = bars[bars.length - 2];          // 已完成的那一根
+  const price = bars[bars.length - 1].close;   // 當前這根的收盤＝現價
+  if (!(prev.close < prev.open)) return { pass: false, failedAt: '上一根不是黑K' };
+  if (!(price > prev.open)) {
+    return { pass: false, failedAt: '未過實體',
+             detail: `現價 ${price} ≤ 開盤 ${prev.open}` };
+  }
+  return { pass: true, detail: `現價 ${price} > 18D黑K開盤 ${prev.open}（實體已收復）` };
 }
 
 function formatTime(seconds) {
@@ -188,23 +181,19 @@ async function waitForChart(symbol, tf, minBars = 2, timeoutMs = LOAD_TIMEOUT) {
 async function scanSymbol(tvSymbol) {
   try {
     await chartSetSymbol(tvSymbol);
+    await chartSetTimeframe(SCAN_TF);
 
-    for (const { tf, label, signal } of TIMEFRAMES) {
-      await chartSetTimeframe(tf);
-
-      let bars;
-      try {
-        bars = await waitForChart(tvSymbol, tf);
-      } catch {
-        return { pass: false, failedAt: label, reason: 'no_data' };
-      }
-
-      if (!checkSignal(bars, signal)) {
-        return { pass: false, failedAt: label };
-      }
+    let bars;
+    try {
+      bars = await waitForChart(tvSymbol, SCAN_TF);
+    } catch {
+      // 新上市幣對常常沒有足夠的 18D 歷史，這是資料問題不是條件不符
+      return { pass: false, failedAt: SCAN_TF, reason: 'no_data' };
     }
 
-    return { pass: true };
+    const r = checkReclaim(bars);
+    if (!r.pass) return { pass: false, failedAt: r.failedAt, detail: r.detail };
+    return { pass: true, detail: r.detail };
   } catch (err) {
     return { pass: false, failedAt: 'load', reason: err.message.slice(0, 60) };
   }
@@ -212,8 +201,8 @@ async function scanSymbol(tvSymbol) {
 
 async function main() {
   console.log('╔══════════════════════════════════════════╗');
-  console.log('║        極速匡策略掃描器  v1.0            ║');
-  console.log('║  18D紅吞 + 3D紅吞 + 1D紅吞 + 3H紅/黑吞 ║');
+  console.log('║        極速匡策略掃描器  v2.0            ║');
+  console.log('║   現價突破上一根 18D 黑K 的實體上緣      ║');
   console.log('╚══════════════════════════════════════════╝\n');
 
   console.log('📡 連接 TradingView CDP...');
@@ -249,7 +238,7 @@ async function main() {
     const result = await scanSymbol(tvSymbol);
 
     if (result.pass) {
-      console.log('✅ 符合');
+      console.log('✅ 符合' + (result.detail ? '　' + result.detail : ''));
       matched.push(tvSymbol);
       consecutiveFails = 0;
     } else if (result.reason === 'no_data') {
@@ -308,7 +297,7 @@ async function main() {
       if (confirmed.length) {
         await notify(
           `${TARGET_LIST}新增標的`,
-          confirmed.map(s => `${bareTicker(s)}（18D+3D+1D 紅吞 + 3H 吞噬）`).join('\n')
+          confirmed.map(s => `${bareTicker(s)}（現價已收復 18D 黑K 實體）`).join('\n')
         );
         console.log(`🔔 已通知 TG：${confirmed.map(bareTicker).join(', ')}`);
       }
