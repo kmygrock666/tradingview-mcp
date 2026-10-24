@@ -4,8 +4,13 @@
  *
  * 監控清單（TradingView watchlist 頁籤）：極速匡、加密貨幣
  *
- * 進場條件（2026-10-25 v3.2，做多，五項全部成立）：
- *   1. 3D：前一根為「黑吞」或「紅吞」，或「當前這根紅吞」
+ * 進場條件（2026-10-25 v3.3，做多，五項全部成立）：
+ *   1. 3D：前一根「收黑K」或「紅吞」，或「當前這根紅吞」
+ *
+ *   吞噬定義（使用者 2026-10-25 重新定義，見 isBullEngulf/isBearEngulf）：
+ *     紅吞＝當前漲過前一根「黑K」的高點且自身收紅
+ *     黑吞＝當前跌破前一根「紅K」的低點且自身收黑
+ *   注意前一根的顏色是必要條件，連續同色不會構成吞噬。
  *   2. 1D：下列兩種型態之一
  *      A. 當前「紅吞」，且當前低點不低於前一根低點，
  *         且當前高點曾經突破「7EMA_5MA」的 MA 1
@@ -109,12 +114,25 @@ const notified = new Set();
 // 幣對確實離開清單後會清掉記錄，日後重新加回才會再通知。
 const removeNotified = new Set();
 
-// ─── 吞噬判斷 ────────────────────────────────────
+// ─── 吞噬判斷（2026-10-25 使用者重新定義）────────────────
+//
+// 紅吞：當前 K 棒漲過「前一根黑K」的高點，且自身收紅。
+// 黑吞：當前 K 棒跌破「前一根紅K」的低點，且自身收黑。
+//
+// 與舊定義的三個差異，改條件時要記得：
+//   1. 比的是「高低點」（含影線），不是收盤價。
+//   2. 比的是前一根的「高／低點」，不是實體邊界。
+//   3. 前一根的顏色是必要條件 —— 紅吞的前一根必須是黑K，黑吞的前一根
+//      必須是紅K。所以連續同色的 K 棒不會構成吞噬。
 function isBullEngulf(c, p) {
-  return c.close > c.open && c.close > Math.max(p.open, p.close);
+  return p.close < p.open      // 前一根是黑K
+    && c.high > p.high         // 當前有漲過它的高點
+    && c.close > c.open;       // 當前自身收紅
 }
 function isBearEngulf(c, p) {
-  return c.close < c.open && c.close < Math.min(p.open, p.close);
+  return p.close > p.open      // 前一根是紅K
+    && c.low < p.low           // 當前有跌破它的低點
+    && c.close < c.open;       // 當前自身收黑
 }
 
 // 往回找最近一根「紅吞」K 棒的索引（從 fromIdx 起往前，找不到回 -1）。
@@ -516,7 +534,7 @@ async function checkEntry(tvSym) {
     const prev2_3d = bars3d[bars3d.length - 3];
     if (!prev2_3d) return null;
     // v3.2 再放寬：除了前一根的兩種吞噬，當前這根紅吞也算
-    const d3Signal = isBearEngulf(prev3d, prev2_3d) ? '前根黑吞'
+    const d3Signal = prev3d.close < prev3d.open ? '前根收黑K'
       : isBullEngulf(prev3d, prev2_3d) ? '前根紅吞'
       : isBullEngulf(curr3d, prev3d) ? '當前紅吞'
       : null;
