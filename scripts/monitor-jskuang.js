@@ -4,7 +4,7 @@
  *
  * 監控清單（TradingView watchlist 頁籤）：極速匡、加密貨幣
  *
- * 進場條件（2026-10-25 v3.3，做多，五項全部成立）：
+ * 進場條件（2026-10-25 v3.4，做多，五項全部成立）：
  *   1. 3D：前一根「收黑K」或「紅吞」，或「當前這根紅吞」
  *
  *   吞噬定義（使用者 2026-10-25 重新定義，見 isBullEngulf/isBearEngulf）：
@@ -19,7 +19,7 @@
  *      （黑吞本身就含收黑，所以實質門檻是「收黑K」；分開記錄只為了統計）
  *   4. 3H：自當前往回找第一根「紅吞且收綠K」，取它的前一根黑K 當斐波那契
  *      錨點（1 = 黑K高點、0 = 黑K低點）← 進場與停損都由這根決定
- *   5. 1H：當前跌破前一根低點且收黑
+ *   5. 1H：當前跌破前一根的「低點或實體低點」且收黑
  *
  *   型態是「大週期轉弱、小週期洗盤，但關鍵低點沒破」的回踩買進。
  *
@@ -598,16 +598,23 @@ async function checkEntry(tvSym) {
     }
     if (!fibBar) return null;
 
-    // 條件5：1H 當前跌破前一根低點且收黑
+    // 條件5：1H 當前跌破前一根的「低點或實體低點」，且收黑（v3.4 放寬）。
+    // 實體低點 min(open, close) 永遠在 K 棒低點之上，比較容易被跌破，所以
+    // 這個「或」實際上由實體那一邊決定 —— 仍分開標記，方便日後比較兩種
+    // 觸發型態的表現。
     await switchTF('60');
     const bars1h = await waitForChart(tvSym, '60', 2, 4);
     const curr1h = bars1h[bars1h.length - 1];
     const prev1h = bars1h[bars1h.length - 2];
-    if (!(curr1h.low < prev1h.low && curr1h.close < curr1h.open)) return null;
+    const prevBodyLow = Math.min(prev1h.open, prev1h.close);
+    const h1Signal = curr1h.low < prev1h.low ? '跌破前低'
+      : curr1h.low < prevBodyLow ? '跌破前根實體低'
+      : null;
+    if (!(h1Signal && curr1h.close < curr1h.open)) return null;
 
     // 進場與停損都由條件 4 的黑K 拉斐波那契決定（0.7 進場、0 停損）
     return { symbol: tvSym, displayName, price: curr1h.close, barTime: curr1h.time,
-             d1Signal, d3Signal, h3Signal,
+             d1Signal, d3Signal, h3Signal, h1Signal,
              anchor3h: anchor3h.low, fibBar,
              prevBar: { high: curr1h.high, low: curr1h.low, time: curr1h.time } };
   } catch (e) {
@@ -780,7 +787,7 @@ async function runScan() {
     for (const s of signals) {
       const lines = [
         `${s.displayName}  @${s.price}`,
-        `3D${s.d3Signal} + ${s.d1Signal} + 3H${s.h3Signal}不破紅吞低(${s.anchor3h}) + 1H跌破前低收黑`,
+        `3D${s.d3Signal} + ${s.d1Signal} + 3H${s.h3Signal}不破紅吞低(${s.anchor3h}) + 1H${s.h1Signal}收黑`,
         `斐波那契錨點：黑K 高${s.fibBar.high} 低${s.fibBar.low}`,
       ];
       if (s.trade?.ok) {
