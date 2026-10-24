@@ -518,6 +518,10 @@ async function checkRemoval18D(tvSym) {
 }
 
 
+// 不通過時回報「卡在第幾關」，而不是單純的 null —— 一直盲調條件卻不知道
+// 瓶頸在哪，等於在猜。每輪會把統計印出來並帶進 TG 摘要。
+function rej(stage, why) { return { rejected: true, stage, why }; }
+
 // ─── 檢查單一幣對的進場條件 ──────────────────────────
 // tvSym 為完整格式，如 "OKX:ENAUSDT.P"
 async function checkEntry(tvSym) {
@@ -527,33 +531,33 @@ async function checkEntry(tvSym) {
     await switchTo(tvSym, '3D');
     const bars3d = await waitForChart(tvSym, '3D', 4, 8);
     const curr3d = bars3d[bars3d.length - 1];
-    if (!(curr3d.close > curr3d.open)) return null;      // 當前要是紅K
+    if (!(curr3d.close > curr3d.open)) return rej('1', '當前3D不是紅K');
     let blackRun = 0;
     for (let i = bars3d.length - 2; i >= 0; i--) {
       if (bars3d[i].close < bars3d[i].open) blackRun++;
       else break;
     }
-    if (blackRun < MIN_RUN) return null;
+    if (blackRun < MIN_RUN) return rej('1', `連續黑K只有 ${blackRun} 根`);
     const d3Signal = `3D連${blackRun}黑轉紅`;
 
     // 條件2：1D 連續收紅K、收盤逐根遞增、其中某根高點過 MA 1，然後出一根黑K
     await switchTF('D');
     const barsD = await waitForChart(tvSym, 'D', 4, 12);
     const currD = barsD[barsD.length - 1];
-    if (!(currD.close < currD.open)) return null;        // 當前要是黑K
+    if (!(currD.close < currD.open)) return rej('2', '當前1D不是黑K');
     const redRun = [];
     for (let i = barsD.length - 2; i >= 0; i--) {
       const b = barsD[i];
       if (b.close > b.open) redRun.unshift(b);
       else break;
     }
-    if (redRun.length < MIN_RUN) return null;
+    if (redRun.length < MIN_RUN) return rej('2', `連續紅K只有 ${redRun.length} 根`);
     for (let i = 1; i < redRun.length; i++) {
-      if (!(redRun[i].close > redRun[i - 1].close)) return null;   // 收盤要遞增
+      if (!(redRun[i].close > redRun[i - 1].close)) return rej('2', '紅K收盤沒遞增');
     }
     // MA 值必須在 1D 這個週期上讀；讀不到會丟錯，由本輪摘要回報
     const maVal = await waitForMaValue();
-    if (!redRun.some(b => b.high > maVal)) return null;
+    if (!redRun.some(b => b.high > maVal)) return rej('2', '沒有任何紅K高點過MA');
     const d1Signal = `1D連${redRun.length}紅遞增過MA(${maVal})後轉黑`;
 
     // 條件3：3H 當前紅吞 —— 紅吞的定義已要求前一根是黑K，那根就是斐波那契錨點
@@ -561,7 +565,7 @@ async function checkEntry(tvSym) {
     const bars3h = await waitForChart(tvSym, '180', 3, 6);
     const curr3h = bars3h[bars3h.length - 1];
     const prev3h = bars3h[bars3h.length - 2];
-    if (!isBullEngulf(curr3h, prev3h)) return null;
+    if (!isBullEngulf(curr3h, prev3h)) return rej('3', '3H不是紅吞');
     const fibBar = { high: prev3h.high, low: prev3h.low, time: prev3h.time };
     // 進場＝往前找連續收黑K 的最後一根的開盤價。紅吞的定義已要求前一根
     // 是黑K，所以那一串連續黑K 的最後一根就是 prev3h。
@@ -575,7 +579,7 @@ async function checkEntry(tvSym) {
     const curr1h = bars1h[bars1h.length - 1];
     const prev1h = bars1h[bars1h.length - 2];
     const prevBodyTop = Math.max(prev1h.open, prev1h.close);
-    if (!(curr1h.close > prevBodyTop)) return null;
+    if (!(curr1h.close > prevBodyTop)) return rej('4', '1H收盤沒過前根實體');
     const h1Signal = `1H收${curr1h.close}過前根實體${prevBodyTop}`;
 
     // 進場與停損由條件 3 的黑K 拉斐波那契決定（0.7 進場、0 停損）
@@ -648,6 +652,7 @@ async function runScan() {
   }
 
   const signals = [];
+  const rejections = new Map();   // 卡關統計：'條件2：紅K收盤沒遞增' → 次數
   const removals = [];
   const errors = [];         // 單一幣對的例外，彙總進本輪摘要
   const scanned = new Set(); // 同一輪跨清單去重：同幣對只掃一次
@@ -678,7 +683,11 @@ async function runScan() {
       }
       scanned.add(tvSym);
       const result = await checkEntry(tvSym);
-      if (result?.error) {
+      if (result?.rejected) {
+        const key = `條件${result.stage}：${result.why}`;
+        rejections.set(key, (rejections.get(key) || 0) + 1);
+        console.log('—');
+      } else if (result?.error) {
         errors.push(`${label}：${result.error}`);
         console.log(`⚠️  ${result.error}`);
       } else if (result) {
@@ -747,6 +756,12 @@ async function runScan() {
       removalNote = `移除失敗（下輪重試）：${e.message}\n${removals.map(r => `${r.displayName}（${r.reason}：${r.detail}）`).join('\n')}`;
       console.error('  ⚠️  移除失敗（下次掃描將重試）:', e.message);
     }
+  }
+
+  // 卡關統計：由多到少，看得出該鬆哪一關
+  const rejSorted = [...rejections.entries()].sort((a, b) => b[1] - a[1]);
+  if (rejSorted.length) {
+    console.log(`\n  📊 卡關統計：${rejSorted.map(([k, n]) => `${k} ×${n}`).join('、')}`);
   }
 
   if (signals.length > 0) {
@@ -831,6 +846,9 @@ async function runScan() {
       ? `結果：${signals.length} 個進場信號（另發個別通知）`
       : '結果：無符合目標',
   ];
+  if (rejSorted.length) {
+    summary.push('卡關：' + esc(rejSorted.slice(0, 5).map(([k, n]) => `${k} ×${n}`).join('\n')));
+  }
   if (!REMOVAL_ENABLED) summary.push('（3D 移除檢查暫停中）');
   if (!TRADING_ENABLED) summary.push('（自動下單已關閉）');
   if (trailNote) summary.push(esc(trailNote));
