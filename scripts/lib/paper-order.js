@@ -457,28 +457,31 @@ export async function placeLimitBracket({ symbol, qty, limitPrice, stopPrice, tp
 
     // 6.5) 分批出場：把這張單設成兩個「出場水平」，各半部位、不同停利。
     // 不能改用兩張單 —— 成交後會併成一個部位，停利會在合併時消失。
-    if (p.exits && p.exits.length === 2) {
+    if (p.exits && p.exits.length >= 2) {
+      // N 層通用（v3 起停利有四段）：先加「最後一批」把面板叫出來，刪掉訂單
+      // 視窗繼承的全額層，再由後往前把其餘各批補上。順序由後往前是因為新增
+      // 的層一律加在最後面，這樣收尾時第一批才會排在最前面。
       if (!clickAddLevel(ticket())) return fail('levels', '找不到「新增水平」');
       await sleep(900);
       if (!levelsPanel()) return fail('levels', '出場水平面板沒開啟');
 
-      // 新增出來的那層是展開的：先設成第二批
-      var e2 = p.exits[1];
-      var err2 = await setExpandedLevel(e2.qty, e2.tp, p.stopPrice);
-      if (err2) return fail('levels', '第二批設定失敗：' + err2);
-      log.push('水平：第二批 ' + e2.qty + ' @ ' + e2.tp);
+      var last = p.exits[p.exits.length - 1];
+      var errLast = await setExpandedLevel(last.qty, last.tp, p.stopPrice);
+      if (errLast) return fail('levels', '最後一批設定失敗：' + errLast);
+      log.push('水平：第 ' + p.exits.length + ' 批 ' + last.qty + ' @ ' + last.tp);
 
-      // 刪掉繼承來的全額層，否則保護倉位大小會變成 150%
+      // 刪掉繼承來的全額層，否則保護倉位大小會爆表
       if (!deleteFullSizeLevel()) return fail('levels', '刪不掉繼承的全額水平');
       await sleep(700);
 
-      // 再加一層，會自動吃下剩餘的 50%
-      if (!clickAddLevel(levelsPanel())) return fail('levels', '第二次「新增水平」失敗');
-      await sleep(900);
-      var e1 = p.exits[0];
-      var err1 = await setExpandedLevel(e1.qty, e1.tp, p.stopPrice);
-      if (err1) return fail('levels', '第一批設定失敗：' + err1);
-      log.push('水平：第一批 ' + e1.qty + ' @ ' + e1.tp);
+      for (var li = p.exits.length - 2; li >= 0; li--) {
+        if (!clickAddLevel(levelsPanel())) return fail('levels', '第 ' + (li + 1) + ' 批新增水平失敗');
+        await sleep(900);
+        var ei = p.exits[li];
+        var erri = await setExpandedLevel(ei.qty, ei.tp, p.stopPrice);
+        if (erri) return fail('levels', '第 ' + (li + 1) + ' 批設定失敗：' + erri);
+        log.push('水平：第 ' + (li + 1) + ' 批 ' + ei.qty + ' @ ' + ei.tp);
+      }
 
       // 兩層加起來必須剛好蓋住整個部位，少了等於有一半沒出場計畫
       var pct = protectionPct();
@@ -486,8 +489,11 @@ export async function placeLimitBracket({ symbol, qty, limitPrice, stopPrice, tp
       // 收合的水平把價格寫在文字裡（帶千分位逗號），展開中的那層在 input 裡，
       // 而且會被補成該商品的價格精度（0.1598 → 0.15980）。字串比對兩種格式
       // 都會踩雷，一律改成「抓出所有數字，用數值比」。
-      if (!levelShown(e1.tp)) return fail('levels', '面板裡看不到第一批停利 ' + e1.tp + '：' + panelDigest());
-      if (!levelShown(e2.tp)) return fail('levels', '面板裡看不到第二批停利 ' + e2.tp + '：' + panelDigest());
+      for (var vi = 0; vi < p.exits.length; vi++) {
+        if (!levelShown(p.exits[vi].tp)) {
+          return fail('levels', '面板裡看不到第 ' + (vi + 1) + ' 批停利 ' + p.exits[vi].tp + '：' + panelDigest());
+        }
+      }
       log.push('保護倉位大小 ' + pct + '%');
       if (!clickLevelsConfirm()) return fail('levels', '找不到水平面板的「確認」');
       await sleep(1000);

@@ -4,14 +4,16 @@
  *
  * 監控清單（TradingView watchlist 頁籤）：極速匡、加密貨幣
  *
- * 進場條件（2026-10-24 改版，做多，四項全部成立）：
+ * 進場條件（2026-10-25 v3，做多，五項全部成立）：
  *   1. 3D：前一根為「黑吞」
  *   2. 1D：下列兩種型態之一
  *      A. 當前「紅吞」，且當前低點不低於前一根低點，
  *         且當前高點曾經突破「7EMA_5MA」的 MA 1
  *      B. 前面連續 2 根以上皆為「紅吞」，而當前為「黑吞」且收黑
  *   3. 3H：當前「黑吞」，且低點沒有跌破「前面最近一根紅吞」的低點
- *   4. 1H：當前跌破前一根低點且收黑 ← 這根就是進場依據
+ *   4. 3H：自當前往回找第一根「紅吞且收綠K」，取它的前一根黑K 當斐波那契
+ *      錨點（1 = 黑K高點、0 = 黑K低點）← 進場與停損都由這根決定
+ *   5. 1H：當前跌破前一根低點且收黑
  *
  *   型態是「大週期轉弱、小週期洗盤，但關鍵低點沒破」的回踩買進。
  *
@@ -21,8 +23,8 @@
  *   18D 歷史，那種情況會回報讀取錯誤（進本輪摘要），不會當成「不用移除」。
  *
  * 自動下單（模擬交易「極速匡帳戶」，見 TRADING_ENABLED）：
- *   抓到進場信號就掛限價單 —— 進場＝1H 觸發那根（條件 4）的最高價，
- *   停損＝該根最低價，R＝兩者之差，停利分 5R 與 10R 兩批各半部位，
+ *   抓到進場信號就掛限價單 —— 價格全部來自條件 4 的斐波那契：
+ *   進場在 0.7、停損在 0（黑K低點），停利四段 10.8/20.8/30.8/50.8 各 1/4 部位，
  *   單筆風險＝權益 2%；總資金虧損超過 20% 時自動降為 0.5%。
  *   保本階梯：價格觸及第 N 個停利點後，停損移到第 N−1 個停利點
  *   （N=1 時移到成本價），每輪檢查一次，只往上搬不往下退。
@@ -549,16 +551,31 @@ async function checkEntry(tvSym) {
     const anchor3h = bars3h[anchorIdx];
     if (curr3h.low < anchor3h.low) return null;
 
-    // 條件4：1H 當前跌破前一根低點且收黑 ← 這根就是下單依據
+    // 條件4：自當前 3H 往回找第一根「紅吞且收綠K」，取它的前一根黑K 當
+    // 斐波那契錨點。紅吞的定義本身就含「收盤 > 開盤」，所以收綠K 是同一件事；
+    // 這裡仍明確檢查，條件改寫時才不會悄悄失效。
+    let fibBar = null;
+    for (let i = bars3h.length - 1; i >= 2; i--) {
+      const c = bars3h[i], prevC = bars3h[i - 1];
+      if (!(isBullEngulf(c, prevC) && c.close > c.open)) continue;
+      const blackBar = bars3h[i - 1];
+      // 前一根必須是黑K；不是的話繼續往回找下一個紅吞
+      if (!(blackBar.close < blackBar.open)) continue;
+      fibBar = { high: blackBar.high, low: blackBar.low, time: blackBar.time };
+      break;
+    }
+    if (!fibBar) return null;
+
+    // 條件5：1H 當前跌破前一根低點且收黑
     await switchTF('60');
     const bars1h = await waitForChart(tvSym, '60', 2, 4);
     const curr1h = bars1h[bars1h.length - 1];
     const prev1h = bars1h[bars1h.length - 2];
     if (!(curr1h.low < prev1h.low && curr1h.close < curr1h.open)) return null;
 
-    // 進場＝這根 1H 的最高價，停損＝它的最低價
+    // 進場與停損都由條件 4 的黑K 拉斐波那契決定（0.7 進場、0 停損）
     return { symbol: tvSym, displayName, price: curr1h.close, barTime: curr1h.time, d1Signal,
-             anchor3h: anchor3h.low,
+             anchor3h: anchor3h.low, fibBar,
              prevBar: { high: curr1h.high, low: curr1h.low, time: curr1h.time } };
   } catch (e) {
     // 單一幣對失敗不中斷整輪，但要記下來讓本輪摘要看得到，不靜默吞掉
@@ -670,7 +687,7 @@ async function runScan() {
           if (TRADING_ENABLED && result.prevBar) {
             try {
               trade = await tradeSignal({
-                symbol: tvSym, prevBar: result.prevBar, barTime: result.barTime,
+                symbol: tvSym, prevBar: result.prevBar, fibBar: result.fibBar, barTime: result.barTime,
               });
               if (trade.skipped) {
                 console.log(`  ⏭ 不下單：${trade.reason}`);
@@ -731,6 +748,7 @@ async function runScan() {
       const lines = [
         `${s.displayName}  @${s.price}`,
         `3D前根黑吞 + ${s.d1Signal} + 3H黑吞不破紅吞低(${s.anchor3h}) + 1H跌破前低收黑`,
+        `斐波那契錨點：黑K 高${s.fibBar.high} 低${s.fibBar.low}`,
       ];
       if (s.trade?.ok) {
         const p3 = s.trade.plan;

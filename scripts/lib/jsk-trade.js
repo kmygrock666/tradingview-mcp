@@ -18,9 +18,14 @@ import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicke
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const JOURNAL = path.join(ROOT, 'trades-jskuang.jsonl');
 
-export const STRATEGY_VERSION = 'v2';  // 進場條件版本，寫進帳本方便分開統計
+export const STRATEGY_VERSION = 'v3';  // 進場條件版本，寫進帳本方便分開統計
 export const RISK_PCT = 0.02;          // 單筆風險 = 權益的 2%
-export const TP_MULTIPLES = [5, 10];   // 兩批停利
+export const TP_MULTIPLES = [5, 10];   // 舊版（v2）的 R 倍數停利，fibBar 缺席時的後備
+// ── v3 斐波那契定價（使用者 2026-10-25）──────────────────
+// 錨點是條件 4 找到的那根 3H 黑K：1 = 黑K高點、0 = 黑K低點。
+// 進場掛在 0.7，停損在 0（黑K低點），停利分四段。
+export const FIB_ENTRY = 0.7;
+export const FIB_TARGETS = [10.8, 20.8, 30.8, 50.8];
 export const ORDER_TTL_MS = 9 * 3600 * 1000;  // 限價單有效期：3 根 3H K 棒
 const LEVERAGE = 10;                   // 帳戶顯示 10x；用來估保證金夠不夠
 const MARGIN_USE_CAP = 0.4;            // 單一信號最多動用 40% 可用資金
@@ -68,11 +73,26 @@ function roundPrice(p, ref) {
  * 由「紅吞前一根」K 棒算出完整的下單計畫。
  * prevBar 需含 high / low。
  */
-export function computePlan({ prevBar, equity, available }) {
-  const entry = prevBar.high;
-  const stop = prevBar.low;
+export function computePlan({ prevBar, fibBar, equity, available }) {
+  // v3（2026-10-25）：價格全部由條件 4 的黑K 拉斐波那契決定 ——
+  //   1 = 黑K 高點、0 = 黑K 低點，進場在 0.7、停損在 0、
+  //   停利四段分別在 10.8 / 20.8 / 30.8 / 50.8。
+  // 舊的 prevBar 介面（進場＝高點、停損＝低點）留著當後備。
+  let entry, stop, targetPrices;
+  if (fibBar) {
+    const span = fibBar.high - fibBar.low;
+    if (!(span > 0)) return { ok: false, reason: `斐波那契區間不是正數（高 ${fibBar.high} 低 ${fibBar.low}）` };
+    const at = (lvl) => roundPrice(fibBar.low + lvl * span, fibBar.low);
+    entry = at(FIB_ENTRY);
+    stop = at(0);
+    targetPrices = FIB_TARGETS.map(lvl => ({ multiple: lvl, price: at(lvl) }));
+  } else {
+    entry = prevBar.high;
+    stop = prevBar.low;
+    targetPrices = null;
+  }
   const R = entry - stop;
-  if (!(R > 0)) return { ok: false, reason: `R 不是正數（高 ${entry} 低 ${stop}）` };
+  if (!(R > 0)) return { ok: false, reason: `R 不是正數（進場 ${entry} 停損 ${stop}）` };
 
   const risk = riskProfile(equity);
   const riskUSD = +(equity * risk.pct).toFixed(2);
@@ -86,17 +106,19 @@ export function computePlan({ prevBar, equity, available }) {
     capped = true;
   }
 
-  const qtyEach = roundQty(qtyTotal / TP_MULTIPLES.length);
+  const targets = targetPrices
+    || TP_MULTIPLES.map(m => ({ multiple: m, price: roundPrice(entry + m * R, entry) }));
+
+  const qtyEach = roundQty(qtyTotal / targets.length);
   if (qtyEach <= 0) return { ok: false, reason: `算出的數量是 0（風險 ${riskUSD} / R ${R}）` };
 
   return {
-    ok: true, entry, stop, R,
-    targets: TP_MULTIPLES.map(m => ({ multiple: m, price: roundPrice(entry + m * R, entry) })),
-    qtyEach, qtyTotal: roundQty(qtyEach * TP_MULTIPLES.length),
+    ok: true, entry, stop, R, targets,
+    qtyEach, qtyTotal: roundQty(qtyEach * targets.length),
     riskUSD, equity, capped,
     riskPct: risk.pct, drawdown: risk.drawdown, riskReduced: risk.reduced,
     // 實際風險：數量被保證金上限砍過的話會小於名目風險
-    actualRiskUSD: +(roundQty(qtyEach * TP_MULTIPLES.length) * R).toFixed(2),
+    actualRiskUSD: +(roundQty(qtyEach * targets.length) * R).toFixed(2),
   };
 }
 
@@ -321,7 +343,7 @@ export async function trailStops() {
 }
 
 /** 給監控器用的一條龍：算計畫 → 下單 → 回傳可直接寫進通知的摘要 */
-export async function tradeSignal({ symbol, prevBar, barTime, dryRun = false }) {
+export async function tradeSignal({ symbol, prevBar, fibBar = null, barTime, dryRun = false }) {
   if (alreadyTraded(symbol, barTime)) {
     return { skipped: true, reason: '這根 K 棒已經下過單' };
   }
@@ -355,7 +377,7 @@ export async function tradeSignal({ symbol, prevBar, barTime, dryRun = false }) 
     return { skipped: true, reason: `${base} 目前仍有未結部位或掛單（${clash}），不重複下` };
   }
 
-  const plan = computePlan({ prevBar, equity: acct.equity, available: acct.available });
+  const plan = computePlan({ prevBar, fibBar, equity: acct.equity, available: acct.available });
   if (!plan.ok) return { ok: false, reason: plan.reason };
 
   const entry = await placeSignalOrders({ symbol, plan, barTime, dryRun });
