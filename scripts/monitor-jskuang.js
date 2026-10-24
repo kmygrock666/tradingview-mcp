@@ -4,8 +4,8 @@
  *
  * 監控清單（TradingView watchlist 頁籤）：極速匡、加密貨幣
  *
- * 進場條件（2026-10-25 v3，做多，五項全部成立）：
- *   1. 3D：前一根為「黑吞」
+ * 進場條件（2026-10-25 v3.1，做多，五項全部成立）：
+ *   1. 3D：前一根為「黑吞」或「紅吞」（兩個方向的吞噬都算）
  *   2. 1D：下列兩種型態之一
  *      A. 當前「紅吞」，且當前低點不低於前一根低點，
  *         且當前高點曾經突破「7EMA_5MA」的 MA 1
@@ -506,12 +506,17 @@ async function checkRemoval18D(tvSym) {
 async function checkEntry(tvSym) {
   const displayName = tvSym.split(':').pop().replace('.P', '');
   try {
-    // 條件1：3D 前一根為黑吞（看的是前一根，不是當前這根）
+    // 條件1：3D 前一根是「吞噬」就算 —— 黑吞或紅吞都接受（v3.1 放寬）。
+    // 看的是前一根，不是當前這根。
     await switchTo(tvSym, '3D');
     const bars3d = await waitForChart(tvSym, '3D', 3, 4);
     const prev3d = bars3d[bars3d.length - 2];
     const prev2_3d = bars3d[bars3d.length - 3];
-    if (!prev2_3d || !isBearEngulf(prev3d, prev2_3d)) return null;
+    if (!prev2_3d) return null;
+    const d3Signal = isBearEngulf(prev3d, prev2_3d) ? '前根黑吞'
+      : isBullEngulf(prev3d, prev2_3d) ? '前根紅吞'
+      : null;
+    if (!d3Signal) return null;
 
     // 條件2：1D 兩種型態之一
     await switchTF('D');
@@ -574,7 +579,7 @@ async function checkEntry(tvSym) {
     if (!(curr1h.low < prev1h.low && curr1h.close < curr1h.open)) return null;
 
     // 進場與停損都由條件 4 的黑K 拉斐波那契決定（0.7 進場、0 停損）
-    return { symbol: tvSym, displayName, price: curr1h.close, barTime: curr1h.time, d1Signal,
+    return { symbol: tvSym, displayName, price: curr1h.close, barTime: curr1h.time, d1Signal, d3Signal,
              anchor3h: anchor3h.low, fibBar,
              prevBar: { high: curr1h.high, low: curr1h.low, time: curr1h.time } };
   } catch (e) {
@@ -747,7 +752,7 @@ async function runScan() {
     for (const s of signals) {
       const lines = [
         `${s.displayName}  @${s.price}`,
-        `3D前根黑吞 + ${s.d1Signal} + 3H黑吞不破紅吞低(${s.anchor3h}) + 1H跌破前低收黑`,
+        `3D${s.d3Signal} + ${s.d1Signal} + 3H黑吞不破紅吞低(${s.anchor3h}) + 1H跌破前低收黑`,
         `斐波那契錨點：黑K 高${s.fibBar.high} 低${s.fibBar.low}`,
       ];
       if (s.trade?.ok) {
