@@ -4,13 +4,14 @@
  *
  * 監控清單（TradingView watchlist 頁籤）：極速匡、加密貨幣
  *
- * 進場條件（2026-10-25 v3.1，做多，五項全部成立）：
- *   1. 3D：前一根為「黑吞」或「紅吞」（兩個方向的吞噬都算）
+ * 進場條件（2026-10-25 v3.2，做多，五項全部成立）：
+ *   1. 3D：前一根為「黑吞」或「紅吞」，或「當前這根紅吞」
  *   2. 1D：下列兩種型態之一
  *      A. 當前「紅吞」，且當前低點不低於前一根低點，
  *         且當前高點曾經突破「7EMA_5MA」的 MA 1
  *      B. 前面連續 2 根以上皆為「紅吞」，而當前為「黑吞」且收黑
- *   3. 3H：當前「黑吞」，且低點沒有跌破「前面最近一根紅吞」的低點
+ *   3. 3H：當前「黑吞」或「收黑K」，且低點沒有跌破「前面最近一根紅吞」的低點
+ *      （黑吞本身就含收黑，所以實質門檻是「收黑K」；分開記錄只為了統計）
  *   4. 3H：自當前往回找第一根「紅吞且收綠K」，取它的前一根黑K 當斐波那契
  *      錨點（1 = 黑K高點、0 = 黑K低點）← 進場與停損都由這根決定
  *   5. 1H：當前跌破前一根低點且收黑
@@ -510,11 +511,14 @@ async function checkEntry(tvSym) {
     // 看的是前一根，不是當前這根。
     await switchTo(tvSym, '3D');
     const bars3d = await waitForChart(tvSym, '3D', 3, 4);
+    const curr3d = bars3d[bars3d.length - 1];
     const prev3d = bars3d[bars3d.length - 2];
     const prev2_3d = bars3d[bars3d.length - 3];
     if (!prev2_3d) return null;
+    // v3.2 再放寬：除了前一根的兩種吞噬，當前這根紅吞也算
     const d3Signal = isBearEngulf(prev3d, prev2_3d) ? '前根黑吞'
       : isBullEngulf(prev3d, prev2_3d) ? '前根紅吞'
+      : isBullEngulf(curr3d, prev3d) ? '當前紅吞'
       : null;
     if (!d3Signal) return null;
 
@@ -549,7 +553,12 @@ async function checkEntry(tvSym) {
     const bars3h = await waitForChart(tvSym, '180', 6, 12);
     const curr3h = bars3h[bars3h.length - 1];
     const prev3h = bars3h[bars3h.length - 2];
-    if (!isBearEngulf(curr3h, prev3h)) return null;
+    // v3.2：黑吞或單純收黑K 都算。黑吞的定義已含「收盤 < 開盤」，所以實質
+    // 門檻就是收黑；仍分開標記，日後要比較兩種型態的表現時才有資料。
+    const h3Signal = isBearEngulf(curr3h, prev3h) ? '黑吞'
+      : curr3h.close < curr3h.open ? '收黑K'
+      : null;
+    if (!h3Signal) return null;
     // 從前一根往回找紅吞當作要守住的低點；找不到就不成立（沒有可守的結構）
     const anchorIdx = findLastBullEngulfIdx(bars3h, bars3h.length - 2);
     if (anchorIdx < 0) return null;
@@ -579,7 +588,8 @@ async function checkEntry(tvSym) {
     if (!(curr1h.low < prev1h.low && curr1h.close < curr1h.open)) return null;
 
     // 進場與停損都由條件 4 的黑K 拉斐波那契決定（0.7 進場、0 停損）
-    return { symbol: tvSym, displayName, price: curr1h.close, barTime: curr1h.time, d1Signal, d3Signal,
+    return { symbol: tvSym, displayName, price: curr1h.close, barTime: curr1h.time,
+             d1Signal, d3Signal, h3Signal,
              anchor3h: anchor3h.low, fibBar,
              prevBar: { high: curr1h.high, low: curr1h.low, time: curr1h.time } };
   } catch (e) {
@@ -752,7 +762,7 @@ async function runScan() {
     for (const s of signals) {
       const lines = [
         `${s.displayName}  @${s.price}`,
-        `3D${s.d3Signal} + ${s.d1Signal} + 3H黑吞不破紅吞低(${s.anchor3h}) + 1H跌破前低收黑`,
+        `3D${s.d3Signal} + ${s.d1Signal} + 3H${s.h3Signal}不破紅吞低(${s.anchor3h}) + 1H跌破前低收黑`,
         `斐波那契錨點：黑K 高${s.fibBar.high} 低${s.fibBar.low}`,
       ];
       if (s.trade?.ok) {
