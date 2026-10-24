@@ -20,6 +20,8 @@ const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
 const MAIN_SERIES = `${CHART_API}._chartWidget.model().mainSeries()`;
 const TF_SECONDS = { '60': 3600, '180': 10800, 'D': 86400, '3D': 259200 };
 const MIN_RUN = 2;
+const LOOKBACK_3D = 5;
+const LOOKBACK_1D = 10;
 const MA_STUDY_NAME = '7EMA_5MA';
 const MA_VALUE_KEY = 'MA 1';
 
@@ -30,7 +32,13 @@ const grab = (name) => {
   if (i < 0) throw new Error(`取不到 ${name}`);
   return src.slice(i, src.indexOf('\n}', i) + 2);
 };
-const { isBullEngulf } = new Function(`${grab('isBullEngulf')}\n${grab('isBearEngulf')}\nreturn { isBullEngulf, isBearEngulf };`)();
+// findBlackToRed 用到 MIN_RUN，當參數餵進沙箱，不要在這裡另寫一份判定
+const { isBullEngulf, findBlackToRed, findRedRunThenBreak } = new Function('MIN_RUN', `
+${grab('isBullEngulf')}
+${grab('isBearEngulf')}
+${grab('findBlackToRed')}
+${grab('findRedRunThenBreak')}
+return { isBullEngulf, isBearEngulf, findBlackToRed, findRedRunThenBreak };`)(MIN_RUN);
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -77,41 +85,37 @@ async function main() {
   console.log(`\n═══ ${symbol} 進場條件診斷 ═══\n`);
   let passed = 0;
 
-  // ── 條件1：3D 連續黑K 後出一根紅K ──
-  const bars3d = await loadBars(symbol, '3D', 8);
+  // ── 條件1：最近 5 根 3D 內曾「連續黑K 後出一根紅K」──
+  const bars3d = await loadBars(symbol, '3D', 12);
   const curr3d = bars3d[bars3d.length - 1];
-  let blackRun = 0;
-  for (let i = bars3d.length - 2; i >= 0; i--) {
-    if (bars3d[i].close < bars3d[i].open) blackRun++; else break;
-  }
-  const c1 = curr3d.close > curr3d.open && blackRun >= MIN_RUN;
+  const btr = findBlackToRed(bars3d, LOOKBACK_3D);
+  const c1 = !!btr;
   if (c1) passed++;
-  console.log(`${mark(c1)} 條件1  3D 連續黑K ≥${MIN_RUN} 根後出紅K`);
-  console.log(`         最近 ${bars3d.length} 根 3D：${bars3d.slice(-6).map(color).join(' ')}`);
-  console.log(`         當前 開${curr3d.open} 收${curr3d.close}（${color(curr3d)}K）　之前連續黑K ${blackRun} 根`);
-  if (!c1) {
-    console.log(`         缺：${curr3d.close > curr3d.open ? `連續黑K 不足（要 ${MIN_RUN} 根，只有 ${blackRun}）` : '當前不是紅K'}`);
+  console.log(`${mark(c1)} 條件1  最近 ${LOOKBACK_3D} 根 3D 內曾連續黑K ≥${MIN_RUN} 根後出一根紅K`);
+  console.log(`         最近 ${bars3d.length} 根 3D：${bars3d.slice(-8).map(color).join(' ')}`);
+  console.log(`         當前 開${curr3d.open} 收${curr3d.close}（${color(curr3d)}K）`);
+  if (c1) {
+    const red = bars3d[btr.redIdx];
+    console.log(`         轉紅那根在 ${btr.agoBars} 根前（開${red.open} 收${red.close}），之前連續黑K ${btr.blackRun} 根`);
+  } else {
+    console.log(`         缺：視窗內每一根紅K 前面的連續黑K 都不足 ${MIN_RUN} 根，或視窗內根本沒有紅K`);
   }
 
-  // ── 條件2：1D 連續紅K 遞增、某根過 MA，然後出黑K ──
-  const barsD = await loadBars(symbol, 'D', 12);
+  // ── 條件2：1D 連續紅K 遞增、某根過 MA，出黑K，後續跌破那根黑K 低點 ──
+  const barsD = await loadBars(symbol, 'D', 20);
   const ma = await readMa();
   const currD = barsD[barsD.length - 1];
-  const redRun = [];
-  for (let i = barsD.length - 2; i >= 0; i--) {
-    const b = barsD[i];
-    if (b.close > b.open) redRun.unshift(b); else break;
-  }
-  const ascending = redRun.every((b, i) => i === 0 || b.close > redRun[i - 1].close);
-  const overMa = Number.isFinite(ma) && redRun.some(b => b.high > ma);
-  const c2 = currD.close < currD.open && redRun.length >= MIN_RUN && ascending && overMa;
+  const d1 = findRedRunThenBreak(barsD, ma, LOOKBACK_1D);
+  const c2 = d1.ok;
   if (c2) passed++;
-  console.log(`\n${mark(c2)} 條件2  1D 連續紅K 遞增且某根高點過 MA 後出黑K`);
-  console.log(`         最近 ${barsD.length} 根 1D：${barsD.slice(-8).map(color).join(' ')}`);
+  console.log(`\n${mark(c2)} 條件2  最近 ${LOOKBACK_1D} 根 1D 內曾連續紅K 遞增且某根高點過 MA 後出黑K，且後續破底`);
+  console.log(`         最近 ${barsD.length} 根 1D：${barsD.slice(-10).map(color).join(' ')}`);
   console.log(`         當前 開${currD.open} 收${currD.close}（${color(currD)}K）　MA 1 = ${Number.isFinite(ma) ? ma : '讀不到'}`);
-  console.log(`         連續紅K ${redRun.length} 根${redRun.length ? `：收盤 ${redRun.map(b => b.close).join(' → ')}` : ''}`);
-  if (redRun.length) {
-    console.log(`         收盤遞增 ${mark(ascending)}　有紅K 高點過 MA ${mark(overMa)}（最高 ${Math.max(...redRun.map(b => b.high))}）`);
+  if (c2) {
+    console.log(`         連續紅K ${d1.redRun.length} 根：收盤 ${d1.redRun.map(b => b.close).join(' → ')}（最高 ${Math.max(...d1.redRun.map(b => b.high))} > MA）`);
+    console.log(`         黑K 在 ${d1.agoBars} 根前（開${d1.black.open} 收${d1.black.close} 低${d1.black.low}），${d1.brokenAgo} 根前跌破它的低點`);
+  } else {
+    console.log(`         缺：${d1.why}（回報的是視窗內最近一根黑K 候選卡在哪）`);
   }
 
   // ── 條件3：3H 當前紅吞 ──

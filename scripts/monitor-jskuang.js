@@ -7,8 +7,9 @@
  * 進場條件（2026-10-25 v5，做多，兩組策略並行，先到先贏）：
  *
  * 【A：破底後由黑轉紅】
- *   1. 3D：連續收黑K 之後，當前出一根紅K
- *   2. 1D：連續收紅K 且收盤逐根遞增、其中某根高點曾突破 MA 1，之後出一根黑K
+ *   1. 3D：最近 5 根內曾「連續收黑K 之後出一根紅K」（轉紅那根不必是當前這根）
+ *   2. 1D：最近 10 根內曾「連續收紅K 且收盤逐根遞增、其中某根高點突破 MA 1，
+ *      之後出一根黑K」，且後續有跌破那根黑K 的低點（破底）
  *   3. 3H：當前為「紅吞」，用它的前一根（黑K）拉斐波那契
  *   4. 1H：當前收盤高於前一根的實體上緣
  *   進場＝3H 前一根（連續黑K 的最後一根）的開盤價，停損＝3H 當前 K 棒最低點
@@ -153,6 +154,75 @@ function findLastBullEngulfIdx(bars, fromIdx) {
     if (isBullEngulf(bars[i], bars[i - 1])) return i;
   }
   return -1;
+}
+
+// 策略A 條件1 的回看視窗：轉紅那根要落在最近幾根 3D 之內。
+const LOOKBACK_3D = 5;
+// 策略A 條件2 的回看視窗：「出黑K」那根要落在最近幾根 1D 之內。
+// 使用者只說「曾」沒給根數，取 10 天；黑K 之前的連續紅K 可以延伸到視窗之外。
+const LOOKBACK_1D = 10;
+
+// 在最近 lookback 根裡找「連續收黑K 之後出一根紅K」的型態。
+// 轉紅那根不必是當前這根 —— 只要型態出現在視窗內就算數。
+// 黑K 串可以延伸到視窗之外：視窗限制的是「多久以前轉紅的」，不是黑K 有多長。
+// 回傳最近的一組 { redIdx, blackRun, agoBars }，找不到回 null。
+function findBlackToRed(bars, lookback) {
+  const start = Math.max(1, bars.length - lookback);
+  for (let i = bars.length - 1; i >= start; i--) {
+    if (!(bars[i].close > bars[i].open)) continue;      // 要是紅K
+    let blackRun = 0;
+    for (let j = i - 1; j >= 0; j--) {
+      if (bars[j].close < bars[j].open) blackRun++; else break;
+    }
+    if (blackRun >= MIN_RUN) return { redIdx: i, blackRun, agoBars: bars.length - 1 - i };
+  }
+  return null;
+}
+
+// 在最近 lookback 根裡找策略A 條件2 的型態：
+//   連續收紅K（收盤遞增、其中某根高點過 MA）→ 出一根黑K → 後續跌破那根黑K 的低點
+// 黑K 不必是當前這根（也不可能是：還需要後面的 K 棒去跌破它）。
+// 回傳最近成立的一組；不成立時 why 取「最近一根黑K 候選」卡在哪，卡關統計才有意義。
+//
+// 注意：maVal 是「現在」的 MA 值，拿去比對可能是好幾天前的紅K 高點。
+// 資料視窗只給得到當下的指標值，要精確就得另外抓 MA 的歷史序列。
+function findRedRunThenBreak(bars, maVal, lookback) {
+  const start = Math.max(1, bars.length - lookback);
+  // why 給人看（帶實際數字），whyKey 給卡關統計用（同類要能累加，不能把價格
+  // 寫進去 —— 每個標的的價格都不一樣，統計就會變成一堆 ×1 的單筆）。
+  // 只記「最近那根黑K 候選」卡在哪；再往回的候選不覆寫它。
+  let why = null, whyKey = null;
+  const note = (msg, key) => { if (why === null) { why = msg; whyKey = key || msg; } };
+  // 從倒數第二根起往回找：最後一根當黑K 的話，後面沒有 K 棒可以跌破它
+  for (let k = bars.length - 2; k >= start; k--) {
+    const black = bars[k];
+    if (!(black.close < black.open)) continue;
+
+    const redRun = [];
+    for (let j = k - 1; j >= 0; j--) {
+      if (bars[j].close > bars[j].open) redRun.unshift(bars[j]); else break;
+    }
+    if (redRun.length < MIN_RUN) { note(`連續紅K只有 ${redRun.length} 根`, `連續紅K不足 ${MIN_RUN} 根`); continue; }
+
+    let ascending = true;
+    for (let i = 1; i < redRun.length; i++) {
+      if (!(redRun[i].close > redRun[i - 1].close)) { ascending = false; break; }
+    }
+    if (!ascending) { note('紅K收盤沒遞增'); continue; }
+
+    if (!redRun.some(b => b.high > maVal)) { note('沒有任何紅K高點過MA'); continue; }
+
+    let brokenIdx = -1;
+    for (let j = k + 1; j < bars.length; j++) {
+      if (bars[j].low < black.low) { brokenIdx = j; break; }
+    }
+    if (brokenIdx < 0) { note(`後續沒跌破黑K低點 ${black.low}`, '後續沒跌破黑K低點'); continue; }
+
+    return { ok: true, redRun, black, blackIdx: k, brokenIdx,
+             agoBars: bars.length - 1 - k, brokenAgo: bars.length - 1 - brokenIdx };
+  }
+  const fallback = `前${lookback}根內沒有黑K`;
+  return { ok: false, why: why || fallback, whyKey: whyKey || fallback };
 }
 
 // 資料視窗的數值是格式化字串（可能含千分位逗號或 K/M/B 後綴）
@@ -537,26 +607,25 @@ async function checkRemoval18D(tvSym) {
 
 /** A：破底後由黑轉紅 */
 function evalStrategyA({ bars3d, barsD, maVal, bars3h, bars1h }) {
-  const curr3d = bars3d[bars3d.length - 1];
-  if (!(curr3d.close > curr3d.open)) return { ok: false, stage: '1', why: '當前3D不是紅K' };
-  let blackRun = 0;
-  for (let i = bars3d.length - 2; i >= 0; i--) {
-    if (bars3d[i].close < bars3d[i].open) blackRun++; else break;
+  // 「前 5 根內曾連續收黑K後出一根紅K」—— 轉紅那根不必是當前這根，只要這個
+  // 型態出現在最近 LOOKBACK_3D 根之內就算數。之前要求當前必須是紅K，等於
+  // 只接受「剛好這一根轉紅」的瞬間，錯過就得等下一輪，大多數標的卡死在這關。
+  const found = findBlackToRed(bars3d, LOOKBACK_3D);
+  if (!found) {
+    const tail = bars3d.slice(-LOOKBACK_3D).map(b => b.close > b.open ? '紅' : b.close < b.open ? '黑' : '平').join('');
+    return { ok: false, stage: '1',
+             why: `前${LOOKBACK_3D}根沒有連${MIN_RUN}黑轉紅（${tail}）`,
+             whyKey: `前${LOOKBACK_3D}根沒有連${MIN_RUN}黑轉紅` };
   }
-  if (blackRun < MIN_RUN) return { ok: false, stage: '1', why: `連續黑K只有 ${blackRun} 根` };
+  const { blackRun, agoBars } = found;
 
-  const currD = barsD[barsD.length - 1];
-  if (!(currD.close < currD.open)) return { ok: false, stage: '2', why: '當前1D不是黑K' };
-  const redRun = [];
-  for (let i = barsD.length - 2; i >= 0; i--) {
-    const b = barsD[i];
-    if (b.close > b.open) redRun.unshift(b); else break;
-  }
-  if (redRun.length < MIN_RUN) return { ok: false, stage: '2', why: `連續紅K只有 ${redRun.length} 根` };
-  for (let i = 1; i < redRun.length; i++) {
-    if (!(redRun[i].close > redRun[i - 1].close)) return { ok: false, stage: '2', why: '紅K收盤沒遞增' };
-  }
-  if (!redRun.some(b => b.high > maVal)) return { ok: false, stage: '2', why: '沒有任何紅K高點過MA' };
+  // 「曾連續收紅K、收盤遞增、某根高點過 MA 1，之後出一根黑K，後續跌破這根
+  // 黑K 的低點」。跟條件1 一樣用「曾」：黑K 不必是當前這根 —— 它本來就不可能
+  // 是，因為還要有後面的 K 棒去跌破它的低點。這個「破底」就是策略A 名字裡的
+  // 破底，條件3 的由黑轉紅才是接在它後面的反轉。
+  const d1 = findRedRunThenBreak(barsD, maVal, LOOKBACK_1D);
+  if (!d1.ok) return { ok: false, stage: '2', why: d1.why, whyKey: d1.whyKey };
+  const { redRun, black: blackD, agoBars: blackAgo, brokenAgo } = d1;
 
   const curr3h = bars3h[bars3h.length - 1];
   const prev3h = bars3h[bars3h.length - 2];
@@ -570,8 +639,8 @@ function evalStrategyA({ bars3d, barsD, maVal, bars3h, bars1h }) {
   return { ok: true, signal: {
     strategy: 'A',
     price: curr1h.close, barTime: curr1h.time,
-    d3Signal: `3D連${blackRun}黑轉紅`,
-    d1Signal: `1D連${redRun.length}紅遞增過MA(${maVal})後轉黑`,
+    d3Signal: agoBars === 0 ? `3D連${blackRun}黑轉紅` : `3D連${blackRun}黑轉紅（${agoBars}根前）`,
+    d1Signal: `1D連${redRun.length}紅遞增過MA(${maVal})後轉黑（${blackAgo}根前，低${blackD.low}），${brokenAgo}根前破底`,
     h3Signal: '紅吞', h1Signal: `1H收${curr1h.close}過前根實體${bodyTop}`,
     fibBar: { high: prev3h.high, low: prev3h.low, time: prev3h.time },
     entryPrice: prev3h.open,     // 連續黑K 最後一根的開盤價
@@ -639,9 +708,11 @@ async function checkEntry(tvSym) {
   try {
     // 四個週期各載入一次，兩組策略共用 —— 分開跑會讓每輪時間加倍
     await switchTo(tvSym, '3D');
-    const bars3d = await waitForChart(tvSym, '3D', 4, 8);
+    // 策略A 條件1 要回看 5 根找「黑轉紅」，再加上它前面的黑K 串，窗口要夠長
+    const bars3d = await waitForChart(tvSym, '3D', 4, 12);
     await switchTF('D');
-    const barsD = await waitForChart(tvSym, 'D', 4, 12);
+    // 策略A 條件2 要回看 10 根找「黑K」，再加上它前面的連續紅K，窗口要夠長
+    const barsD = await waitForChart(tvSym, 'D', 4, 20);
     const maVal = await waitForMaValue();   // MA 必須在 1D 上讀
     await switchTF('180');
     // 策略B 條件3 要往回找「前面那根紅吞」，窗口太短會找不到而誤判，多抓一些
@@ -656,7 +727,11 @@ async function checkEntry(tvSym) {
     if (b.ok) return { symbol: tvSym, displayName, ...b.signal };
 
     // 兩組都不過：兩邊的卡關原因都回報，統計才看得出各自的瓶頸
-    return { rejected: true, a: { stage: a.stage, why: a.why }, b: { stage: b.stage, why: b.why } };
+    // whyKey 一定要一起帶出去 —— 漏掉的話卡關統計會退回用 why，價格就又
+    // 回到統計的 key 裡，同一個原因被拆成一堆 ×1。
+    return { rejected: true,
+             a: { stage: a.stage, why: a.why, whyKey: a.whyKey },
+             b: { stage: b.stage, why: b.why, whyKey: b.whyKey } };
   } catch (e) {
     // 單一幣對失敗不中斷整輪，但要記下來讓本輪摘要看得到，不靜默吞掉
     return { error: e.message || String(e) };
@@ -756,7 +831,9 @@ async function runScan() {
       const result = await checkEntry(tvSym);
       if (result?.rejected) {
         for (const [tag, r] of [['A', result.a], ['B', result.b]]) {
-          const key = `${tag}條件${r.stage}：${r.why}`;
+          // 統計要用 whyKey（不含價格等各標的不同的數字），否則同一個原因會
+          // 被拆成一堆 ×1，前五名全是單筆，等於沒有統計。
+          const key = `${tag}條件${r.stage}：${r.whyKey || r.why}`;
           rejections.set(key, (rejections.get(key) || 0) + 1);
         }
         console.log('—');
