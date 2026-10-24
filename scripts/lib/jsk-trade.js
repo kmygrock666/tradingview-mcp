@@ -18,7 +18,7 @@ import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicke
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const JOURNAL = path.join(ROOT, 'trades-jskuang.jsonl');
 
-export const STRATEGY_VERSION = 'v3.4';  // 進場條件版本，寫進帳本方便分開統計
+export const STRATEGY_VERSION = 'v4';  // 進場條件版本，寫進帳本方便分開統計
 export const RISK_PCT = 0.02;          // 單筆風險 = 權益的 2%
 export const TP_MULTIPLES = [5, 10];   // 舊版（v2）的 R 倍數停利，fibBar 缺席時的後備
 // ── v3 斐波那契定價（使用者 2026-10-25）──────────────────

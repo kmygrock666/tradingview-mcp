@@ -4,24 +4,19 @@
  *
  * 監控清單（TradingView watchlist 頁籤）：極速匡、加密貨幣
  *
- * 進場條件（2026-10-25 v3.4，做多，五項全部成立）：
- *   1. 3D：前一根「收黑K」或「紅吞」，或「當前這根紅吞」
+ * 進場條件（2026-10-25 v4「破底後由黑轉紅」，做多，四項全部成立）：
+ *   1. 3D：連續收黑K 之後，當前出一根紅K
+ *   2. 1D：連續收紅K 且收盤逐根遞增、其中某根的高點曾突破「7EMA_5MA」
+ *      的 MA 1，之後當前出一根黑K
+ *   3. 3H：當前為「紅吞」，用它的前一根（黑K）拉斐波那契
+ *      （1 = 黑K高點、0 = 黑K低點）← 進場與停損都由這根決定
+ *   4. 1H：當前收盤高於前一根的實體上緣
  *
- *   吞噬定義（使用者 2026-10-25 重新定義，見 isBullEngulf/isBearEngulf）：
+ *   吞噬定義（見 isBullEngulf/isBearEngulf）：
  *     紅吞＝當前漲過前一根「黑K」的高點且自身收紅
  *     黑吞＝當前跌破前一根「紅K」的低點且自身收黑
- *   注意前一根的顏色是必要條件，連續同色不會構成吞噬。
- *   2. 1D：下列兩種型態之一
- *      A. 當前「紅吞」，且當前低點不低於前一根低點，
- *         且當前高點曾經突破「7EMA_5MA」的 MA 1
- *      B. 前面連續 2 根以上皆為「紅吞」，而當前為「黑吞」且收黑
- *   3. 3H：當前「黑吞」或「收黑K」，且低點沒有跌破「前面最近一根紅吞」的低點
- *      （黑吞本身就含收黑，所以實質門檻是「收黑K」；分開記錄只為了統計）
- *   4. 3H：自當前往回找第一根「紅吞且收綠K」，取它的前一根黑K 當斐波那契
- *      錨點（1 = 黑K高點、0 = 黑K低點）← 進場與停損都由這根決定
- *   5. 1H：當前跌破前一根的「低點或實體低點」且收黑
  *
- *   型態是「大週期轉弱、小週期洗盤，但關鍵低點沒破」的回踩買進。
+ *   「連續」一律指 2 根以上。
  *
  * 極速匡移除條件（僅極速匡頁籤，見 REMOVAL_ENABLED）：
  *   18D 當前 K棒為「黑吞」→ 自清單移除並通知。
@@ -97,6 +92,9 @@ const HEARTBEAT_GRACE_MIN = 5;
 const REMOVAL_ENABLED = process.env.JSK_REMOVAL
   ? process.env.JSK_REMOVAL.toLowerCase() === 'on'
   : true;
+// 進場條件裡「連續收黑K／連續收紅K」至少要幾根。字面上「連續」就是 2 根
+// 以上，調這個等於調整型態的嚴格程度。
+const MIN_RUN = 2;
 // 移除檢查要抓的 18D K 棒數（只需要當前與前一根，多抓一點確保間距對得上）
 const REMOVAL_BARS_18D = 4;
 // Telegram 發送逾時（ms）。Node fetch 預設不逾時，卡住會拖垮整輪。
@@ -525,97 +523,59 @@ async function checkRemoval18D(tvSym) {
 async function checkEntry(tvSym) {
   const displayName = tvSym.split(':').pop().replace('.P', '');
   try {
-    // 條件1：3D 前一根是「吞噬」就算 —— 黑吞或紅吞都接受（v3.1 放寬）。
-    // 看的是前一根，不是當前這根。
+    // 條件1：3D 連續收黑K 之後，當前出一根紅K
     await switchTo(tvSym, '3D');
-    const bars3d = await waitForChart(tvSym, '3D', 3, 4);
+    const bars3d = await waitForChart(tvSym, '3D', 4, 8);
     const curr3d = bars3d[bars3d.length - 1];
-    const prev3d = bars3d[bars3d.length - 2];
-    const prev2_3d = bars3d[bars3d.length - 3];
-    if (!prev2_3d) return null;
-    // v3.2 再放寬：除了前一根的兩種吞噬，當前這根紅吞也算
-    const d3Signal = prev3d.close < prev3d.open ? '前根收黑K'
-      : isBullEngulf(prev3d, prev2_3d) ? '前根紅吞'
-      : isBullEngulf(curr3d, prev3d) ? '當前紅吞'
-      : null;
-    if (!d3Signal) return null;
+    if (!(curr3d.close > curr3d.open)) return null;      // 當前要是紅K
+    let blackRun = 0;
+    for (let i = bars3d.length - 2; i >= 0; i--) {
+      if (bars3d[i].close < bars3d[i].open) blackRun++;
+      else break;
+    }
+    if (blackRun < MIN_RUN) return null;
+    const d3Signal = `3D連${blackRun}黑轉紅`;
 
-    // 條件2：1D 兩種型態之一
+    // 條件2：1D 連續收紅K、收盤逐根遞增、其中某根高點過 MA 1，然後出一根黑K
     await switchTF('D');
-    // 型態 B 要往回看「連續 2 根以上紅吞」，所以要多抓幾根
-    const dBars = await waitForChart(tvSym, 'D', 4, 8);
-    const currD = dBars[dBars.length - 1];
-    const prevD = dBars[dBars.length - 2];
-
-    // 型態 A：當前紅吞 + 低點不低於前一根 + 高點曾突破 MA 1
-    let d1Signal = null;
-    if (isBullEngulf(currD, prevD) && currD.low >= prevD.low) {
-      // MA 值要在 1D 這個週期上讀，讀不到會丟錯由本輪摘要回報
-      const maVal = await waitForMaValue();
-      if (currD.high > maVal) d1Signal = `1D紅吞不破前低且高點過MA(${maVal})`;
+    const barsD = await waitForChart(tvSym, 'D', 4, 12);
+    const currD = barsD[barsD.length - 1];
+    if (!(currD.close < currD.open)) return null;        // 當前要是黑K
+    const redRun = [];
+    for (let i = barsD.length - 2; i >= 0; i--) {
+      const b = barsD[i];
+      if (b.close > b.open) redRun.unshift(b);
+      else break;
     }
-
-    // 型態 B：前面連續 2 根以上紅吞，當前黑吞且收黑
-    if (!d1Signal && isBearEngulf(currD, prevD) && currD.close < currD.open) {
-      let bullRun = 0;
-      for (let i = dBars.length - 2; i >= 1; i--) {
-        if (isBullEngulf(dBars[i], dBars[i - 1])) bullRun++;
-        else break;
-      }
-      if (bullRun >= 2) d1Signal = `1D連${bullRun}根紅吞後黑吞收黑`;
+    if (redRun.length < MIN_RUN) return null;
+    for (let i = 1; i < redRun.length; i++) {
+      if (!(redRun[i].close > redRun[i - 1].close)) return null;   // 收盤要遞增
     }
-    if (!d1Signal) return null;
+    // MA 值必須在 1D 這個週期上讀；讀不到會丟錯，由本輪摘要回報
+    const maVal = await waitForMaValue();
+    if (!redRun.some(b => b.high > maVal)) return null;
+    const d1Signal = `1D連${redRun.length}紅遞增過MA(${maVal})後轉黑`;
 
-    // 條件3：3H 當前黑吞，且低點沒跌破「前面最近一根紅吞」的低點
+    // 條件3：3H 當前紅吞 —— 紅吞的定義已要求前一根是黑K，那根就是斐波那契錨點
     await switchTF('180');
-    const bars3h = await waitForChart(tvSym, '180', 6, 12);
+    const bars3h = await waitForChart(tvSym, '180', 3, 6);
     const curr3h = bars3h[bars3h.length - 1];
     const prev3h = bars3h[bars3h.length - 2];
-    // v3.2：黑吞或單純收黑K 都算。黑吞的定義已含「收盤 < 開盤」，所以實質
-    // 門檻就是收黑；仍分開標記，日後要比較兩種型態的表現時才有資料。
-    const h3Signal = isBearEngulf(curr3h, prev3h) ? '黑吞'
-      : curr3h.close < curr3h.open ? '收黑K'
-      : null;
-    if (!h3Signal) return null;
-    // 從前一根往回找紅吞當作要守住的低點；找不到就不成立（沒有可守的結構）
-    const anchorIdx = findLastBullEngulfIdx(bars3h, bars3h.length - 2);
-    if (anchorIdx < 0) return null;
-    const anchor3h = bars3h[anchorIdx];
-    if (curr3h.low < anchor3h.low) return null;
+    if (!isBullEngulf(curr3h, prev3h)) return null;
+    const fibBar = { high: prev3h.high, low: prev3h.low, time: prev3h.time };
 
-    // 條件4：自當前 3H 往回找第一根「紅吞且收綠K」，取它的前一根黑K 當
-    // 斐波那契錨點。紅吞的定義本身就含「收盤 > 開盤」，所以收綠K 是同一件事；
-    // 這裡仍明確檢查，條件改寫時才不會悄悄失效。
-    let fibBar = null;
-    for (let i = bars3h.length - 1; i >= 2; i--) {
-      const c = bars3h[i], prevC = bars3h[i - 1];
-      if (!(isBullEngulf(c, prevC) && c.close > c.open)) continue;
-      const blackBar = bars3h[i - 1];
-      // 前一根必須是黑K；不是的話繼續往回找下一個紅吞
-      if (!(blackBar.close < blackBar.open)) continue;
-      fibBar = { high: blackBar.high, low: blackBar.low, time: blackBar.time };
-      break;
-    }
-    if (!fibBar) return null;
-
-    // 條件5：1H 當前跌破前一根的「低點或實體低點」，且收黑（v3.4 放寬）。
-    // 實體低點 min(open, close) 永遠在 K 棒低點之上，比較容易被跌破，所以
-    // 這個「或」實際上由實體那一邊決定 —— 仍分開標記，方便日後比較兩種
-    // 觸發型態的表現。
+    // 條件4：1H 當前收盤高於前一根的實體上緣
     await switchTF('60');
     const bars1h = await waitForChart(tvSym, '60', 2, 4);
     const curr1h = bars1h[bars1h.length - 1];
     const prev1h = bars1h[bars1h.length - 2];
-    const prevBodyLow = Math.min(prev1h.open, prev1h.close);
-    const h1Signal = curr1h.low < prev1h.low ? '跌破前低'
-      : curr1h.low < prevBodyLow ? '跌破前根實體低'
-      : null;
-    if (!(h1Signal && curr1h.close < curr1h.open)) return null;
+    const prevBodyTop = Math.max(prev1h.open, prev1h.close);
+    if (!(curr1h.close > prevBodyTop)) return null;
+    const h1Signal = `1H收${curr1h.close}過前根實體${prevBodyTop}`;
 
-    // 進場與停損都由條件 4 的黑K 拉斐波那契決定（0.7 進場、0 停損）
+    // 進場與停損由條件 3 的黑K 拉斐波那契決定（0.7 進場、0 停損）
     return { symbol: tvSym, displayName, price: curr1h.close, barTime: curr1h.time,
-             d1Signal, d3Signal, h3Signal, h1Signal,
-             anchor3h: anchor3h.low, fibBar,
+             d1Signal, d3Signal, h3Signal: '紅吞', h1Signal, fibBar,
              prevBar: { high: curr1h.high, low: curr1h.low, time: curr1h.time } };
   } catch (e) {
     // 單一幣對失敗不中斷整輪，但要記下來讓本輪摘要看得到，不靜默吞掉
@@ -787,7 +747,7 @@ async function runScan() {
     for (const s of signals) {
       const lines = [
         `${s.displayName}  @${s.price}`,
-        `3D${s.d3Signal} + ${s.d1Signal} + 3H${s.h3Signal}不破紅吞低(${s.anchor3h}) + 1H${s.h1Signal}收黑`,
+        `${s.d3Signal} + ${s.d1Signal} + 3H${s.h3Signal} + ${s.h1Signal}`,
         `斐波那契錨點：黑K 高${s.fibBar.high} 低${s.fibBar.low}`,
       ];
       if (s.trade?.ok) {
