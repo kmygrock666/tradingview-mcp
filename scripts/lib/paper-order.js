@@ -651,11 +651,27 @@ export async function listPositions() {
     });
     var rows = els.filter(function(e){ return !els.some(function(o){ return o !== e && e.contains(o); }); });
     return { ok: true, rows: rows.map(function(e){
-      var cells = (e.innerText || '').split(String.fromCharCode(10)).join(String.fromCharCode(9))
-        .split(String.fromCharCode(9)).map(function(s){ return s.trim(); }).filter(Boolean);
+      // 一定要逐一讀 <td>，不能把整列的 innerText 切開再濾掉空字串：沒設停利
+      // 的部位，停利那一格是空的，濾掉之後後面每一欄都左移一格 —— 最新價會
+      // 讀成未實現損益。SKYAI（0.034 的幣）因此被當成 89.56，停損階梯算出
+      // 10R、要把停損拉到市價之上，等於一掛上去就市價平倉。
+      // （2026-10-25 發現，只因為出場水平面板打不開才沒真的執行。）
+      var tds = Array.prototype.slice.call(e.children);
+      var cells = tds.map(function(td){
+        return (td.innerText || '').split(String.fromCharCode(10)).join(' ').trim();
+      });
       // 欄位順序固定：[0]商品 [1]方向 [2]數量 [3]均價 [4]停利 [5]停損 [6]最新價 [7]未實現
-      // 停利/停損在多層出場時顯示成「2個水平」，所以不能用「第幾個數字」來找最新價。
-      var num = function(s){ var v = parseFloat(String(s).replace(/,/g, '')); return isFinite(v) ? v : null; };
+      // 停利/停損在多層出場時顯示成「2個水平」，沒設定時是空字串。
+      // 負數用的是 U+2212 MINUS SIGN（−）不是 ASCII 的 -，parseFloat 吃不下，
+      // 所有虧損的未實現損益都會變成 null。千分位逗號也要先拿掉。
+      var num = function(s){
+        var v = parseFloat(String(s).replace(/,/g, '').replace(/−/g, '-'));
+        return isFinite(v) ? v : null;
+      };
+      var lv = function(s){
+        if (!s) return 0;                                    // 空＝這一側沒有出場計畫
+        return s.indexOf('個水平') >= 0 ? parseInt(s, 10) : 1;
+      };
       return {
         symbol: cells.filter(function(c){ return c.indexOf(':') >= 0; })[0] || null,
         side: cells.filter(function(c){ return c === '做多' || c === '做空'; })[0] || null,
@@ -663,7 +679,8 @@ export async function listPositions() {
         avg: num(cells[3]),
         last: num(cells[6]),
         upnl: num(cells[7]),
-        levels: (cells[4] || '').indexOf('個水平') >= 0 ? parseInt(cells[4], 10) : 1,
+        levels: lv(cells[4]),          // 停利側的層數；0 代表完全沒設停利
+        stopLevels: lv(cells[5]),
         cells: cells.slice(0, 10)
       };
     }) };
