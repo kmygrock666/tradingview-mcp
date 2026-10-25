@@ -100,6 +100,69 @@ const PAGE_EXIT_LEVELS = `
     }
     return best;
   }
+  // 部位編輯器的「簡易出場表單」：只有停利／停損兩格，沒有「保護倉位大小」。
+  // 單層（或沒有停利）的部位開出來就是這個，levelsPanel() 找不到它。
+  function simpleExitForm() {
+    return Array.prototype.slice.call(document.querySelectorAll('div')).filter(function(d){
+      var t = d.innerText || '';
+      return d.offsetParent !== null && /捨棄/.test(t) && /退出/.test(t) && t.length < 5000;
+    }).sort(function(a, b){ return (a.innerText||'').length - (b.innerText||'').length; })[0] || null;
+  }
+  // 「停利 ticks」「停損 價格」這類模式按鈕（取 host 裡最後一顆 —— 多層畫面
+  // 上面還留著簡易表單那一組，展開中的那層在後面）
+  function modeBtnIn(hostFn, prefix) {
+    var host = hostFn();
+    if (!host) return null;
+    var hits = Array.prototype.slice.call(host.querySelectorAll('button')).filter(function(b){
+      var t = (b.textContent || '').trim();
+      return b.offsetParent !== null && t.indexOf(prefix) === 0 && t.length > prefix.length;
+    });
+    return hits.length ? hits[hits.length - 1] : null;
+  }
+  // 把某一側切成「價格」模式。
+  //
+  // 不切的話那一格是 ticks：填 0.04397 會被當成 0.04397 個 tick、四捨五入成 0，
+  // 面板跟著掛上「停利必須高於當前bid」，那個錯誤狀態下連「新增水平」都點不動
+  // —— 四層只會有兩層真的建出來（保護停在 150%）。
+  // 下拉選單是渲染在 host 之外的，所以要排除 host 內部那顆顯示等值價格的
+  // 「價格」按鈕 —— 點到它等於什麼都沒做。
+  async function forcePriceModeIn(hostFn, prefix) {
+    var m = modeBtnIn(hostFn, prefix);
+    if (!m) return '找不到「' + prefix + '」的模式按鈕';
+    if (/價格/.test(m.textContent || '')) return null;
+    clickLike(m);
+    await sleep(600);
+    var host = hostFn();
+    var opts = Array.prototype.slice.call(document.querySelectorAll('div,span,li,button')).filter(function(e){
+      return e.offsetParent !== null && (e.textContent || '').trim() === '價格'
+        && e.children.length === 0 && (!host || !host.contains(e));
+    });
+    if (!opts.length) return '「' + prefix + '」的下拉選單裡找不到「價格」';
+    clickLike(opts[0]);
+    await sleep(800);
+    var after = modeBtnIn(hostFn, prefix);
+    if (!after || !/價格/.test(after.textContent || '')) {
+      return '「' + prefix + '」切換後仍是「' + (after ? (after.textContent||'').trim() : '?') + '」';
+    }
+    return null;
+  }
+  function forceSimplePriceMode(prefix) { return forcePriceModeIn(simpleExitForm, prefix); }
+  // 用真的滑鼠事件點（有些元件不理會 el.click()）
+  function clickLike(el) {
+    var r = el.getBoundingClientRect();
+    ['mousedown','mouseup','click'].forEach(function(type){
+      el.dispatchEvent(new MouseEvent(type, { bubbles:true, cancelable:true, view:window,
+        clientX: r.left + r.width/2, clientY: r.top + r.height/2 }));
+    });
+  }
+  // 「新增水平」在整個畫面上的那一顆（部位編輯器的簡易表單階段還沒有面板容器
+  // 可以當搜尋範圍，所以這裡從 document 找，取最後一顆＝最靠近操作中的那區）
+  function findAddLevel() {
+    var hits = Array.prototype.slice.call(document.querySelectorAll('*')).filter(function(e){
+      return e.offsetParent !== null && (e.textContent || '').trim() === '新增水平';
+    });
+    return hits.length ? hits[hits.length - 1] : null;
+  }
   function clickAddLevel(root) {
     if (!root) return false;
     var hits = Array.prototype.slice.call(root.querySelectorAll('*')).filter(function(e){
@@ -128,12 +191,24 @@ const PAGE_EXIT_LEVELS = `
   async function setExpandedLevel(qty, tp, sl) {
     var pnl = levelsPanel();
     if (!pnl) return '面板不見了';
+    // 展開中那層的停利／停損各自有模式，從訂單視窗進來時是「價格」，但從部位
+    // 編輯器進來時會是 ticks。ticks 模式下填價格會被算成 0，那層就是無效的，
+    // 而且連帶讓下一次「新增水平」失效 —— 要先切回價格。
+    var tpMode = await forcePriceModeIn(levelsPanel, '停利');
+    if (tpMode) return tpMode;
+    var slMode = await forcePriceModeIn(levelsPanel, '停損');
+    if (slMode) return slMode;
     var ins = levelInputs();
     if (ins.length < 3) return '展開中的水平只有 ' + ins.length + ' 個欄位';
     var tail = ins.slice(-3);
     setInput(tail[0], qty); await sleep(500);
     setInput(tail[1], tp);  await sleep(400);
     setInput(tail[2], sl);  await sleep(400);
+    // 讀回來確認停利真的是我們填的價，不是被 ticks 模式吃掉變成別的數字
+    var back = levelInputs().slice(-3);
+    if (!back.length || Math.abs(parseFloat(back[1].value) - parseFloat(tp)) > Math.abs(tp) * 1e-6) {
+      return '停利填不進去（欄位顯示 ' + (back[1] ? back[1].value : '?') + '，預期 ' + tp + '）';
+    }
     return null;
   }
   // 面板文字一律用換行切開再比對：這段程式會經過「JS 檔 → 樣板字串 → 頁面」
@@ -774,6 +849,44 @@ export async function rebuildPositionExits({ symbol, levels, stopPrice, posQty =
     rows[0].querySelector('[data-name="edit-settings-cell-button"]').click();
     // 面板出現的時間會隨部位數與負載變動，用輪詢不要寫死
     for (var w2 = 0; w2 < 30 && !levelsPanel(); w2++) await sleep(150);
+
+    // 部位只有 1 層（或沒有停利）時，TradingView 開的是「簡易出場表單」——
+    // 只有停利／停損兩格，沒有「新增水平」也沒有「保護倉位大小」，levelsPanel()
+    // 自然找不到。SKYAI 的 10 筆 stop-move-failed 全是卡在這裡。
+    // 要先把停利打開（停利欄旁邊那個無標籤的 icon 鈕），「新增水平」才會出現；
+    // 按一次新增水平之後才切到多層畫面，下面整套流程才有東西可操作。
+    var cameFromSimple = false;
+    if (!levelsPanel()) {
+      var simple = simpleExitForm();
+      if (!simple) return fail('panel', '出場水平面板沒開啟，也找不到簡易出場表單');
+
+      // 1) 打開停利（停利欄旁邊那顆無標籤的 icon 鈕，第一顆是停利側）
+      var icons = Array.prototype.slice.call(simple.querySelectorAll('button')).filter(function(b){
+        return b.offsetParent !== null && /iconButton/.test(String(b.className || ''));
+      });
+      if (!icons.length) return fail('panel', '簡易表單裡找不到啟用停利的按鈕');
+      icons[0].click();
+      await sleep(1200);
+
+      // 2) 切成價格模式，並填一個有效的停利價（第一段目標）。
+      //    打開停利時帶進來的預設值是舊的、低於市價，面板會卡在
+      //    「停利必須高於當前bid」，那個錯誤狀態下「新增水平」點了沒反應。
+      var modeErr = await forceSimplePriceMode('停利');
+      if (modeErr) return fail('panel', modeErr);
+      var sIns = Array.prototype.slice.call(simpleExitForm().querySelectorAll('input'))
+        .filter(function(i){ return i.type !== 'checkbox'; });
+      if (!sIns.length) return fail('panel', '簡易表單裡找不到停利輸入欄');
+      setInput(sIns[0], p.levels[0].tp);
+      await sleep(900);
+
+      // 3) 這時才點得動「新增水平」，點完就切到多層畫面
+      for (var w3 = 0; w3 < 20 && !findAddLevel(); w3++) await sleep(150);
+      if (!findAddLevel()) return fail('panel', '啟用停利後仍沒出現「新增水平」');
+      clickLike(findAddLevel());
+      for (var w4 = 0; w4 < 40 && !levelsPanel(); w4++) await sleep(150);
+      cameFromSimple = true;
+      log.push('由簡易表單切換到多層畫面（停利先設為 ' + p.levels[0].tp + '）');
+    }
     if (!levelsPanel()) return fail('panel', '出場水平面板沒開啟（等了 4.5 秒）');
 
     // 部位數量（決定每批數量，必須落在商品的數量步長上）
@@ -789,7 +902,10 @@ export async function rebuildPositionExits({ symbol, levels, stopPrice, posQty =
     if (!qtyToken) return fail('qty', '讀不到部位數量（呼叫端也沒提供 posQty）');
     var posQty = parseFloat(String(qtyToken).replace(/,/g, ''));
     var decimals = (String(qtyToken).split('.')[1] || '').length;
-    var each = (posQty / p.levels.length).toFixed(decimals + 1);
+    // 小數位要跟部位數量一樣，不能多給一位：多的那位讓數量落在商品步長之外，
+    // 欄位會悄悄退回預設值（不是報錯），四層就各自變成 12.5% 而不是 25%，
+    // 保護倉位大小停在 50%。32032.032 ÷ 4 要寫成 8008.008，不是 8008.0080。
+    var each = (posQty / p.levels.length).toFixed(decimals);
     log.push('部位 ' + posQty + ' → 每批 ' + each);
 
     // 收合的水平改不動，只能重建；但「先刪光再加」行不通 —— 刪到最後一層時
@@ -820,11 +936,45 @@ export async function rebuildPositionExits({ symbol, levels, stopPrice, posQty =
     var origCount = levelRows().length;
     log.push('原有水平 ' + origCount + ' 層');
 
-    // 照原本的停利價加上新的層，只有停損換成新的
-    for (var i = 0; i < p.levels.length; i++) {
-      if (!levelsPanel()) return fail('add', '面板不見了（第 ' + (i + 1) + ' 層）');
-      if (!clickAddLevel(levelsPanel())) return fail('add', '第 ' + (i + 1) + ' 層新增失敗');
+    // 從部位編輯器進來時，前置那次「新增水平」把原本的全額層切成
+    // 99.99% + 0.01%。保護倉位大小一旦到 150%，面板就不再讓你新增 ——
+    // 第 3、4 次點「新增水平」完全沒反應，setExpandedLevel 只是反覆覆寫同一層，
+    // 四段停利最後只剩頭尾兩段。所以這條路要先把全額層刪掉再加。
+    // （訂單視窗那條路不能這樣做：那裡只有一層，刪完面板會退回基本編輯器。）
+    if (cameFromSimple) {
+      if (!deleteFullSizeLevel()) return fail('delete', '刪不掉繼承的全額水平（前置後）');
       await sleep(900);
+      log.push('先刪掉全額層：保護 ' + protectionPct() + '%');
+    }
+
+    // 照原本的停利價加上新的層，只有停損換成新的。
+    //
+    // TradingView 每個部位最多 4 層，滿了之後「新增水平」就靜靜地沒反應 ——
+    // 不報錯、也不新增，setExpandedLevel 於是反覆覆寫同一層，四段停利最後
+    // 只剩頭尾。所以每加一層都要確認保護倉位大小真的變大了；沒變大就表示
+    // 名額被舊的殘層（例如前置切出來的 0.01% 碎片）佔著，刪掉一層再試一次。
+    // 判斷「真的新增了一層」要在寫值之前做：新增成功時，原本展開的那層會收合，
+    // 收合列數因此 +1。等到寫完值才發現沒新增就來不及了 —— setExpandedLevel
+    // 已經把上一層的停利覆蓋掉，那一段目標價就永遠消失了。
+    for (var i = 0; i < p.levels.length; i++) {
+      var added = false;
+      for (var attempt = 0; attempt < 2 && !added; attempt++) {
+        if (!levelsPanel()) return fail('add', '面板不見了（第 ' + (i + 1) + ' 層）');
+        var rowsBefore = levelRows().length;
+        if (!clickAddLevel(levelsPanel())) return fail('add', '第 ' + (i + 1) + ' 層新增失敗');
+        await sleep(900);
+        if (levelRows().length > rowsBefore) { added = true; break; }
+
+        // 沒加進去＝名額滿了（上限 4 層）。刪掉最前面那層殘層空出名額再試一次。
+        // 這時還沒寫任何值，所以重試不會弄丟前一層的停利。
+        var stale = levelRows()[0];
+        if (attempt === 0 && stale && deleteRow(stale)) {
+          await sleep(900);
+          log.push('第 ' + (i + 1) + ' 層名額滿了，刪一層殘層後重試');
+          continue;
+        }
+        return fail('add', '第 ' + (i + 1) + ' 層加不進去（收合列數停在 ' + rowsBefore + '）');
+      }
       var err = await setExpandedLevel(each, p.levels[i].tp, p.stopPrice);
       if (err) return fail('set', '第 ' + (i + 1) + ' 層設定失敗：' + err);
       log.push('水平' + (i + 1) + ' ' + each + ' @ TP ' + p.levels[i].tp + ' / SL ' + p.stopPrice);
@@ -832,19 +982,29 @@ export async function rebuildPositionExits({ symbol, levels, stopPrice, posQty =
 
     log.push('加完新層：共 ' + levelRows().length + ' 層、保護 ' + protectionPct() + '%');
 
-    // 新的加好了，把原本那幾層刪掉（它們固定排在前面）
+    // 新的加好了，把原本那幾層刪掉（它們固定排在前面）。
+    //
+    // 結束條件看「保護倉位大小」不看列數：levelRows() 只認得收合且帶 TP 的列，
+    // 展開中的那層、以及只有停損沒有停利的層都數不到，拿列數當門檻會提早跳出
+    // ——「原有 1 層、加 4 層、結果數到 3 層」就是這樣來的，一層都沒刪就離開，
+    // 保護停在 150%。百分比是面板自己算的，不受列數偵測的死角影響。
     var deleted = 0;
-    for (var d2 = 0; d2 < origCount + 3; d2++) {
+    for (var d2 = 0; d2 < origCount + p.levels.length + 3; d2++) {
+      var pctNow = protectionPct();
+      if (!isFinite(pctNow) || pctNow <= 100 + 1) break;
       var rowsNow = levelRows();
-      if (rowsNow.length <= p.levels.length) break;
-      if (!deleteRow(rowsNow[0])) return fail('delete', '刪不掉舊水平（目前 ' + rowsNow.length + ' 層）');
+      if (!rowsNow.length) break;
+      if (!deleteRow(rowsNow[0])) return fail('delete', '刪不掉舊水平（保護 ' + pctNow + '%）');
       deleted++;
       await sleep(900);
     }
     log.push('刪除 ' + deleted + ' 層後：共 ' + levelRows().length + ' 層、保護 ' + protectionPct() + '%');
 
     var pct = protectionPct();
-    if (!(Math.abs(pct - 100) < 1.5)) return fail('pct', '保護倉位大小 ' + pct + '%，不是 100%');
+    if (!(Math.abs(pct - 100) < 1.5)) {
+      // 帶上面板實際內容，不然只看到一個百分比根本不知道哪幾層出了事
+      return fail('pct', '保護倉位大小 ' + pct + '%，不是 100%｜' + panelLines().join(' / ').slice(0, 500));
+    }
     if (!levelShown(p.stopPrice)) return fail('verify', '面板看不到新停損 ' + p.stopPrice + '：' + panelDigest());
     for (var j = 0; j < p.levels.length; j++) {
       if (!levelShown(p.levels[j].tp)) return fail('verify', '面板看不到停利 ' + p.levels[j].tp);
@@ -854,6 +1014,17 @@ export async function rebuildPositionExits({ symbol, levels, stopPrice, posQty =
     if (!clickLevelsConfirm()) return fail('confirm', '找不到水平面板的確認');
     await sleep(1500);
 
+    // 部位編輯器是兩層的：水平面板一個「確認」、外層編輯器還有一個。
+    // 只按內層的話面板會收起來、看起來像成功，但部位其實原封不動
+    // （SKYAI 第一次跑出 ok:true 卻還是沒有停利就是這樣）。
+    for (var cf = 0; cf < 3; cf++) {
+      var outer = Array.prototype.slice.call(document.querySelectorAll('button,[role="button"]'))
+        .filter(function(b){ return b.offsetParent !== null && (b.textContent||'').trim() === '確認'; })[0];
+      if (!outer) break;
+      clickLike(outer);
+      await sleep(1200);
+    }
+
     // 後端拒絕只會跳 toast，不讀就會把失敗當成功（數量步長不合法是常見原因）
     var toast = Array.prototype.slice.call(document.querySelectorAll('*')).filter(function(e){
       var t = (e.innerText || '');
@@ -861,7 +1032,21 @@ export async function rebuildPositionExits({ symbol, levels, stopPrice, posQty =
     }).map(function(e){ return (e.innerText || '').replace(/\\s+/g, ' ').trim(); })[0];
     if (toast) return fail('rejected', '後端拒絕：' + toast.slice(0, 120));
 
-    return { ok: true, log: log, posQty: posQty, each: each };
+    // 讀回持倉列確認真的掛上去了 —— 面板看起來對不等於後端接受了
+    var applied = null;
+    for (var vr = 0; vr < 20 && applied === null; vr++) {
+      var prow = positionRows().filter(function(e){ return (e.innerText||'').indexOf(p.symbol) >= 0; })[0];
+      if (prow) {
+        var tds = Array.prototype.slice.call(prow.children).map(function(td){
+          return (td.innerText || '').split(String.fromCharCode(10)).join(' ').trim(); });
+        if (tds[4]) applied = tds[4];
+      }
+      if (applied === null) await sleep(300);
+    }
+    if (applied === null) return fail('verify', '確認後持倉列的停利欄仍是空的');
+    log.push('持倉列停利欄：' + applied);
+
+    return { ok: true, log: log, posQty: posQty, each: each, applied: applied };
   })()`);
 }
 
