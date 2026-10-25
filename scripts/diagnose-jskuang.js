@@ -83,7 +83,7 @@ const color = (b) => b.close > b.open ? '紅' : b.close < b.open ? '黑' : '平'
 async function main() {
   const symbol = process.argv[2] || 'BINGX:DOSUSDT.P';
   await connect();
-  console.log(`\n═══ ${symbol} 策略A（回檔不破後由黑轉紅）═══\n`);
+  console.log(`\n═══ ${symbol} 策略A（破底後由黑轉紅）═══\n`);
   let passed = 0;
 
   // ── 條件1：最近 5 根 3D 內曾「連續黑K 後出一根紅K」──
@@ -109,12 +109,13 @@ async function main() {
   const d1 = findRedRunThenHold(barsD, ma, LOOKBACK_1D);
   const c2 = d1.ok;
   if (c2) passed++;
-  console.log(`\n${mark(c2)} 條件2  最近 ${LOOKBACK_1D} 根 1D 內曾連續紅K 遞增且某根高點過 MA 後出黑K，且後續未曾跌破它的低點`);
+  console.log(`\n${mark(c2)} 條件2  最近 ${LOOKBACK_1D} 根 1D 內曾連續紅K 遞增且某根高點過 MA 後出黑K，且後續未跌破它的低點、曾漲過它的高點`);
   console.log(`         最近 ${barsD.length} 根 1D：${barsD.slice(-10).map(color).join(' ')}`);
   console.log(`         當前 開${currD.open} 收${currD.close}（${color(currD)}K）　MA 1 = ${Number.isFinite(ma) ? ma : '讀不到'}`);
   if (c2) {
     console.log(`         連續紅K ${d1.redRun.length} 根：收盤 ${d1.redRun.map(b => b.close).join(' → ')}（最高 ${Math.max(...d1.redRun.map(b => b.high))} > MA）`);
-    console.log(`         黑K 在 ${d1.agoBars} 根前（開${d1.black.open} 收${d1.black.close} 低${d1.black.low}），之後 ${d1.heldBars} 根都沒跌破它的低點`);
+    console.log(`         黑K 在 ${d1.agoBars} 根前（開${d1.black.open} 收${d1.black.close} 高${d1.black.high} 低${d1.black.low}）`);
+    console.log(`         之後都沒跌破低點 ${d1.black.low}，並在 ${d1.overAgo} 根前漲過高點 ${d1.black.high}`);
   } else {
     console.log(`         缺：${d1.why}（回報的是視窗內最近一根黑K 候選卡在哪）`);
   }
@@ -132,19 +133,22 @@ async function main() {
   console.log(`         前一根 開${prev3h.open} 高${prev3h.high} 低${prev3h.low} 收${prev3h.close}（${color(prev3h)}K）`);
   console.log(`         當前   開${curr3h.open} 高${curr3h.high} 低${curr3h.low} 收${curr3h.close}（${color(curr3h)}K）`);
   console.log(`         當前紅吞 ${mark(engulf3h)}（高點過前根 ${mark(curr3h.high > prev3h.high)}　自身收紅 ${mark(curr3h.close > curr3h.open)}）　或　前一根收黑K ${mark(prevBlack3h)}`);
-  if (c3) {
-    console.log(`         → 進場 ${prev3h.open}（前根開盤）　停損 ${curr3h.low}（當前低點）`);
-  }
 
-  // ── 條件4：1H 收盤過前根實體上緣 ──
+  // ── 條件4：1H 當前紅吞 或 前一根收黑K；進場停損由前一根的斐波那契決定 ──
   const bars1h = await loadBars(symbol, '60', 4);
   const curr1h = bars1h[bars1h.length - 1];
   const prev1h = bars1h[bars1h.length - 2];
-  const bodyTop = Math.max(prev1h.open, prev1h.close);
-  const c4 = curr1h.close > bodyTop;
+  const engulf1h = isBullEngulf(curr1h, prev1h);
+  const prevBlack1h = prev1h.close < prev1h.open;
+  const c4 = engulf1h || prevBlack1h;
   if (c4) passed++;
-  console.log(`\n${mark(c4)} 條件4  1H 收盤高於前一根實體上緣`);
-  console.log(`         前一根實體上緣 ${bodyTop}　當前收盤 ${curr1h.close}　差 ${(curr1h.close - bodyTop).toFixed(8)}`);
+  console.log(`\n${mark(c4)} 條件4  1H 當前紅吞 或 前一根收黑K（擇一即可）`);
+  console.log(`         前一根 開${prev1h.open} 高${prev1h.high} 低${prev1h.low} 收${prev1h.close}（${color(prev1h)}K）`);
+  console.log(`         當前   開${curr1h.open} 高${curr1h.high} 低${curr1h.low} 收${curr1h.close}（${color(curr1h)}K）`);
+  console.log(`         當前紅吞 ${mark(engulf1h)}（高點過前根 ${mark(curr1h.high > prev1h.high)}　自身收紅 ${mark(curr1h.close > curr1h.open)}）　或　前一根收黑K ${mark(prevBlack1h)}`);
+  if (c4) {
+    console.log(`         → 進場 ${prev1h.high}（斐波那契 1）　停損 ${prev1h.low}（斐波那契 0）`);
+  }
 
   console.log(`\n═══ 策略A 結果：符合 ${passed} / 4 項 ═══`);
   if (passed < 4) {
@@ -198,13 +202,14 @@ async function main() {
     console.log(`         當前低點 ${curr3h.low}　差 ${(curr3h.low - anchor3h.low).toFixed(8)}`);
   }
 
-  // ── B條件4：1H 當前紅吞 ──
-  const b4 = isBullEngulf(curr1h, prev1h);
+  // ── B條件4：1H 當前紅吞 或 自身收黑 ──
+  const black1h = curr1h.close < curr1h.open;
+  const b4 = engulf1h || black1h;
   if (b4) passedB++;
-  console.log(`\n${mark(b4)} B條件4  1H 當前紅吞（並用前一根拉斐波那契）`);
+  console.log(`\n${mark(b4)} B條件4  1H 當前紅吞 或 自身收黑（擇一即可，並用前一根拉斐波那契）`);
   console.log(`         前一根 高${prev1h.high} 低${prev1h.low} 收${prev1h.close}（${color(prev1h)}K）`);
   console.log(`         當前   高${curr1h.high} 低${curr1h.low} 收${curr1h.close}（${color(curr1h)}K）`);
-  console.log(`         高點過前根 ${mark(curr1h.high > prev1h.high)}　自身收紅 ${mark(curr1h.close > curr1h.open)}`);
+  console.log(`         當前紅吞 ${mark(engulf1h)}　或　自身收黑 ${mark(black1h)}`);
   if (b4) {
     console.log(`         → 進場 ${prev1h.high}（斐波那契 1）　停損 ${prev1h.low}（斐波那契 0）`);
   }
