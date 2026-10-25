@@ -120,19 +120,16 @@ async function main() {
     console.log(`         缺：${d1.why}（回報的是視窗內最近一根黑K 候選卡在哪）`);
   }
 
-  // ── 條件3：3H 當前紅吞 或 前一根收黑K ──
+  // ── 條件3：3H 前一根收黑K（當前這根不限型態）──
   // 12 根：策略B 條件3 要往回找「前面最近一根紅吞」，窗口太短會誤判成沒有
   const bars3h = await loadBars(symbol, '180', 12);
   const curr3h = bars3h[bars3h.length - 1];
   const prev3h = bars3h[bars3h.length - 2];
-  const engulf3h = isBullEngulf(curr3h, prev3h);
-  const prevBlack3h = prev3h.close < prev3h.open;
-  const c3 = engulf3h || prevBlack3h;
+  const c3 = prev3h.close < prev3h.open;
   if (c3) passed++;
-  console.log(`\n${mark(c3)} 條件3  3H 當前紅吞 或 前一根收黑K（擇一即可）`);
+  console.log(`\n${mark(c3)} 條件3  3H 前一根收黑K（當前這根不限型態）`);
   console.log(`         前一根 開${prev3h.open} 高${prev3h.high} 低${prev3h.low} 收${prev3h.close}（${color(prev3h)}K）`);
   console.log(`         當前   開${curr3h.open} 高${curr3h.high} 低${curr3h.low} 收${curr3h.close}（${color(curr3h)}K）`);
-  console.log(`         當前紅吞 ${mark(engulf3h)}（高點過前根 ${mark(curr3h.high > prev3h.high)}　自身收紅 ${mark(curr3h.close > curr3h.open)}）　或　前一根收黑K ${mark(prevBlack3h)}`);
 
   // ── 條件4：1H 當前紅吞（不放寬）；進場停損由前一根的斐波那契決定 ──
   const bars1h = await loadBars(symbol, '60', 4);
