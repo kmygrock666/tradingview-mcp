@@ -37,6 +37,13 @@ const TF_SECONDS = { '180': 10800, 'D': 86400, '3D': 259200, '18D': 1555200 };
 
 // 符合幣對要加入的雲端清單名稱（透過 REST 指名加入，與目前開啟的頁籤無關）
 const TARGET_LIST = '極速匡';
+// 候選池：BingX USDT 永續「24 小時漲幅」排行取前幾名。
+//
+// 這道篩子跟判定條件（收復 18D 黑K 實體）其實沒有必然關係 —— 後者是中長期的
+// 結構訊號，今天漲多少並不決定它成不成立。REZUSDT 2026-10-26 就是這樣漏掉的：
+// 條件完全符合，但 24h 只漲 10.21%、在 665 個上漲合約裡排第 26，擠不進前 20。
+// 2026-10-26 由 20 放寬到 35。每多一名大約多 1 秒掃描時間。
+const TOP_N = 35;
 // 切換後的沉澱時間（ms）。資料是否就緒改由 waitForChart 輪詢判定，
 // 這裡只要讓 setSymbol/setResolution 有機會生效即可。
 // 連續這麼多個標的讀不到資料就中止：CDP 卡住時每個標的都會「無資料」，
@@ -111,9 +118,9 @@ async function fetchBingxSymbols() {
   const sorted = json.data
     .filter(c => c.symbol.endsWith('-USDT') && parseFloat(c.priceChangePercent) > 0)
     .sort((a, b) => parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent))
-    .slice(0, 20);
+    .slice(0, TOP_N);
 
-  console.log('📈 前 20 名漲幅排行：');
+  console.log(`📈 前 ${TOP_N} 名漲幅排行：`);
   sorted.forEach((c, i) => {
     const pct = parseFloat(c.priceChangePercent).toFixed(2);
     console.log(`   ${String(i+1).padStart(2)}. ${c.symbol.padEnd(16)} +${pct}%`);
@@ -220,7 +227,7 @@ async function main() {
   console.log('📋 取得 BingX USDT 永續合約清單...');
   const rawSymbols = await fetchBingxSymbols();
   const total = rawSymbols.length;
-  console.log(`✅ 共 ${total} 個幣對（24h 漲幅前 20 名）\n`);
+  console.log(`✅ 共 ${total} 個幣對（24h 漲幅前 ${TOP_N} 名）\n`);
   console.log('─'.repeat(58));
 
   const matched = [];
