@@ -109,13 +109,13 @@ async function main() {
   const d1 = findRedRunThenHold(barsD, ma, LOOKBACK_1D);
   const c2 = d1.ok;
   if (c2) passed++;
-  console.log(`\n${mark(c2)} 條件2  最近 ${LOOKBACK_1D} 根 1D 內曾連續紅K 遞增且某根高點過 MA 後出黑K，且後續未跌破它的低點、曾漲過它的高點`);
+  console.log(`\n${mark(c2)} 條件2  最近 ${LOOKBACK_1D} 根 1D 內曾連續紅K 遞增且某根高點過 MA 後出黑K，且後續未跌破它的低點、也未漲過它的高點`);
   console.log(`         最近 ${barsD.length} 根 1D：${barsD.slice(-10).map(color).join(' ')}`);
   console.log(`         當前 開${currD.open} 收${currD.close}（${color(currD)}K）　MA 1 = ${Number.isFinite(ma) ? ma : '讀不到'}`);
   if (c2) {
     console.log(`         連續紅K ${d1.redRun.length} 根：收盤 ${d1.redRun.map(b => b.close).join(' → ')}（最高 ${Math.max(...d1.redRun.map(b => b.high))} > MA）`);
     console.log(`         黑K 在 ${d1.agoBars} 根前（開${d1.black.open} 收${d1.black.close} 高${d1.black.high} 低${d1.black.low}）`);
-    console.log(`         之後都沒跌破低點 ${d1.black.low}，並在 ${d1.overAgo} 根前漲過高點 ${d1.black.high}`);
+    console.log(`         之後都沒跌破低點 ${d1.black.low}，也都沒漲過高點 ${d1.black.high}`);
   } else {
     console.log(`         缺：${d1.why}（回報的是視窗內最近一根黑K 候選卡在哪）`);
   }
