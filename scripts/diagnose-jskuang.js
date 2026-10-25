@@ -134,18 +134,17 @@ async function main() {
   console.log(`         當前   開${curr3h.open} 高${curr3h.high} 低${curr3h.low} 收${curr3h.close}（${color(curr3h)}K）`);
   console.log(`         當前紅吞 ${mark(engulf3h)}（高點過前根 ${mark(curr3h.high > prev3h.high)}　自身收紅 ${mark(curr3h.close > curr3h.open)}）　或　前一根收黑K ${mark(prevBlack3h)}`);
 
-  // ── 條件4：1H 當前紅吞 或 前一根收黑K；進場停損由前一根的斐波那契決定 ──
+  // ── 條件4：1H 當前紅吞（不放寬）；進場停損由前一根的斐波那契決定 ──
   const bars1h = await loadBars(symbol, '60', 4);
   const curr1h = bars1h[bars1h.length - 1];
   const prev1h = bars1h[bars1h.length - 2];
   const engulf1h = isBullEngulf(curr1h, prev1h);
-  const prevBlack1h = prev1h.close < prev1h.open;
-  const c4 = engulf1h || prevBlack1h;
+  const c4 = engulf1h;
   if (c4) passed++;
-  console.log(`\n${mark(c4)} 條件4  1H 當前紅吞 或 前一根收黑K（擇一即可）`);
+  console.log(`\n${mark(c4)} 條件4  1H 當前紅吞（這關不放寬）`);
   console.log(`         前一根 開${prev1h.open} 高${prev1h.high} 低${prev1h.low} 收${prev1h.close}（${color(prev1h)}K）`);
   console.log(`         當前   開${curr1h.open} 高${curr1h.high} 低${curr1h.low} 收${curr1h.close}（${color(curr1h)}K）`);
-  console.log(`         當前紅吞 ${mark(engulf1h)}（高點過前根 ${mark(curr1h.high > prev1h.high)}　自身收紅 ${mark(curr1h.close > curr1h.open)}）　或　前一根收黑K ${mark(prevBlack1h)}`);
+  console.log(`         高點過前根 ${mark(curr1h.high > prev1h.high)}　自身收紅 ${mark(curr1h.close > curr1h.open)}`);
   if (c4) {
     console.log(`         → 進場 ${prev1h.high}（斐波那契 1）　停損 ${prev1h.low}（斐波那契 0）`);
   }

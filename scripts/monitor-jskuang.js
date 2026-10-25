@@ -11,7 +11,7 @@
  *   2. 1D：最近 10 根內曾「連續收紅K 且收盤逐根遞增、其中某根高點突破 MA 1，
  *      之後出一根黑K」，且後續「未曾」跌破那根黑K 的低點、並「曾漲過」它的高點
  *   3. 3H：當前為「紅吞」或前一根收黑K（擇一）
- *   4. 1H：當前為「紅吞」或前一根收黑K（擇一），用前一根拉斐波那契
+ *   4. 1H：當前為「紅吞」（這關不放寬），用前一根拉斐波那契
  *   進場＝斐波那契 1（前一根高點），停損＝斐波那契 0（前一根低點）
  *
  * 【B：突破後進場】
@@ -650,22 +650,18 @@ function evalStrategyA({ bars3d, barsD, maVal, bars3h, bars1h }) {
     return { ok: false, stage: '3', why: '3H既不是紅吞、前一根也不是黑K' };
   }
 
-  // 條件4 跟條件3 同形，只是換到 1H：當前紅吞 或 前一根收黑K，擇一即可。
+  // 條件4 只認「當前紅吞」—— 跟條件3 不同，這裡沒有「或前一根收黑K」的放寬。
   // 斐波那契錨在前一根（1=高點、0=低點），進場與停損都由它決定。
   const curr1h = bars1h[bars1h.length - 1];
   const prev1h = bars1h[bars1h.length - 2];
-  const engulf1h = isBullEngulf(curr1h, prev1h);
-  const prevBlack1h = prev1h.close < prev1h.open;
-  if (!engulf1h && !prevBlack1h) {
-    return { ok: false, stage: '4', why: '1H既不是紅吞、前一根也不是黑K' };
-  }
+  if (!isBullEngulf(curr1h, prev1h)) return { ok: false, stage: '4', why: '1H不是紅吞' };
 
   return { ok: true, signal: {
     strategy: 'A',
     price: curr1h.close, barTime: curr1h.time,
     d3Signal: agoBars === 0 ? `3D連${blackRun}黑轉紅` : `3D連${blackRun}黑轉紅（${agoBars}根前）`,
     d1Signal: `1D連${redRun.length}紅遞增過MA(${maVal})後轉黑（${blackAgo}根前，低${blackD.low}未破、${overAgo}根前過高${blackD.high}）`,
-    h3Signal: engulf3h ? '紅吞' : '前根收黑', h1Signal: engulf1h ? '1H紅吞' : '1H前根收黑',
+    h3Signal: engulf3h ? '紅吞' : '前根收黑', h1Signal: '1H紅吞',
     fibBar: { high: prev1h.high, low: prev1h.low, time: prev1h.time },
     entryPrice: prev1h.high,     // 斐波那契 1
     stopPrice: prev1h.low,       // 斐波那契 0
