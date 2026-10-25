@@ -892,7 +892,9 @@ async function runScan() {
                   const fib = await drawEntryFib({
                     fibBar: result.fibBar, targets: p2.targets, tag: result.displayName,
                   });
-                  console.log(fib.ok ? `  📐 已畫斐波那契（${fib.id}）` : `  ⚠️  斐波那契沒畫成：${fib.reason}`);
+                  console.log(fib.skipped ? `  📐 ${fib.reason}，不重複拉`
+                    : fib.ok ? `  📐 已畫斐波那契（${fib.id}）`
+                    : `  ⚠️  斐波那契沒畫成：${fib.reason}`);
                 }
               } else {
                 console.warn(`  ⚠️  下單失敗：${trade.reason || trade.entry?.orders?.map(o => o.step + ':' + o.detail).join('；')}`);

@@ -36,7 +36,8 @@ function level(coeff, color, text) {
  * @param {{time:number, high:number, low:number}} fibBar 拉斐波那契的那根黑K
  * @param {Array<{multiple:number, price:number}>} targets 停利各段（只取 multiple）
  * @param {string} [tag] 寫在 0 / 1 兩條線上的說明文字前綴
- * @returns {Promise<{ok:boolean, id?:string, reason?:string}>}
+ * @returns {Promise<{ok:boolean, skipped?:boolean, id?:string, reason?:string}>}
+ *   skipped 代表圖上已經有斐波那契、這次沒動手（不是失敗）
  */
 export async function drawEntryFib({ fibBar, targets = [], tag = '' }) {
   if (!fibBar || !(fibBar.high > fibBar.low)) {
@@ -61,21 +62,15 @@ export async function drawEntryFib({ fibBar, targets = [], tag = '' }) {
   // 用不到的層一律關掉，否則預設的 0.236 / 0.382 … 會混進來
   for (let i = levels.length + 1; i <= 24; i++) props[`level${i}`] = [0, '#787B86', false, ''];
 
-  // 同一根 fibBar 之前畫過就先拆掉，避免同一個標的反覆出訊號時疊成一團。
-  // 只刪「錨點完全相同的斐波那契」—— 使用者自己在圖上畫的東西不能動。
-  await evaluate(`(function(){
+  // 這個標的圖上已經有斐波那契就不再畫 —— 不是只比對錨點，是任何一條都算。
+  // 繪圖是跟著商品走的，所以 getAllShapes() 拿到的就是這個標的自己的圖；
+  // 這也順便保住使用者手動拉的那條不會被我們蓋掉或疊上去。
+  const existing = await evaluate(`(function(){
     var api = ${API};
-    api.getAllShapes().forEach(function(s){
-      if (s.name !== 'fib_retracement') return;
-      try {
-        var pts = api.getShapeById(s.id).getPoints();
-        if (pts.length === 2
-          && pts[0].time === ${fibBar.time} && pts[1].time === ${fibBar.time}
-          && Math.abs(pts[0].price - ${fibBar.high}) < 1e-12
-          && Math.abs(pts[1].price - ${fibBar.low}) < 1e-12) api.removeEntity(s.id);
-      } catch (e) {}
-    });
+    var hit = api.getAllShapes().filter(function(s){ return s.name === 'fib_retracement'; })[0];
+    return hit ? hit.id : null;
   })()`);
+  if (existing) return { ok: true, skipped: true, id: existing, reason: '圖上已有斐波那契' };
 
   // 建立與設定必須分兩次送：createMultipointShape 回來時 shape 還沒進
   // getAllShapes()，同一段 script 裡接著找一定是空的。
