@@ -10,9 +10,10 @@
  *   1. 3D：最近 5 根內曾「連續收黑K 之後出一根紅K」（轉紅那根不必是當前這根）
  *   2. 1D：最近 10 根內曾「連續收紅K 且收盤逐根遞增、其中某根高點突破 MA 1，
  *      之後出一根黑K」，且後續「未曾」跌破那根黑K 的低點、並「曾漲過」它的高點
- *   3. 3H：前一根收黑K（當前這根不限型態）
- *   4. 1H：當前為「紅吞」（這關不放寬），用前一根拉斐波那契
- *   進場＝斐波那契 1（前一根高點），停損＝斐波那契 0（前一根低點）
+ *   3. 3H：前一根收黑K，或（前一根為「紅吞」且當前收黑）
+ *   4. 1H：當前為「紅吞」；否則往前找最近一根紅吞，當前低點不得跌破它的低點
+ *   進場＝斐波那契 1、停損＝斐波那契 0，錨在「那根紅吞的前一根」
+ *   （當前就是紅吞時即前一根；走回看分支時則是那根紅吞的前一根）
  *
  * 【B：突破後進場】
  *   1. 3D：當前為「紅吞」
@@ -641,26 +642,52 @@ function evalStrategyA({ bars3d, barsD, maVal, bars3h, bars1h }) {
   if (!d1.ok) return { ok: false, stage: '2', why: d1.why, whyKey: d1.whyKey };
   const { redRun, black: blackD, agoBars: blackAgo, overAgo } = d1;
 
-  // 只看前一根收不收黑，當前這根是什麼型態不管（曾一度放寬成「當前紅吞 或
-  // 前一根收黑」，已收回）
+  // 條件3：前一根收黑 或（前一根是紅吞 且 當前收黑）。
+  // 後者是「紅吞之後拉回一根黑K」—— 一樣是回檔，只是回檔那根出現在當前。
+  const curr3h = bars3h[bars3h.length - 1];
   const prev3h = bars3h[bars3h.length - 2];
-  if (!(prev3h.close < prev3h.open)) return { ok: false, stage: '3', why: '3H前一根不是黑K' };
+  const prevBlack3h = prev3h.close < prev3h.open;
+  const prevEngulfCurrBlack3h = bars3h.length >= 3
+    && isBullEngulf(prev3h, bars3h[bars3h.length - 3])
+    && curr3h.close < curr3h.open;
+  if (!prevBlack3h && !prevEngulfCurrBlack3h) {
+    return { ok: false, stage: '3', why: '3H前一根不是黑K、也不是「前根紅吞+當前收黑」' };
+  }
 
-  // 條件4 只認「當前紅吞」—— 跟條件3 不同，這裡沒有「或前一根收黑K」的放寬。
-  // 斐波那契錨在前一根（1=高點、0=低點），進場與停損都由它決定。
+  // 條件4：當前紅吞 → 斐波那契錨在前一根；
+  //        否則往前找最近一根紅吞，當前低點不得跌破它的低點，
+  //        斐波那契錨在「那根紅吞的前一根」。
+  // 兩個分支的錨點都是「紅吞的前一根」，差別只在那根紅吞是不是當前這根。
   const curr1h = bars1h[bars1h.length - 1];
   const prev1h = bars1h[bars1h.length - 2];
-  if (!isBullEngulf(curr1h, prev1h)) return { ok: false, stage: '4', why: '1H不是紅吞' };
+  let fibIdx1h, h1Signal;
+  if (isBullEngulf(curr1h, prev1h)) {
+    fibIdx1h = bars1h.length - 2;
+    h1Signal = '1H紅吞';
+  } else {
+    const ei = findLastBullEngulfIdx(bars1h, bars1h.length - 2);
+    if (ei < 1) {
+      return { ok: false, stage: '4', why: `1H不是紅吞，往前${bars1h.length - 1}根也找不到紅吞` };
+    }
+    const anchor1h = bars1h[ei];
+    if (!(curr1h.low >= anchor1h.low)) {
+      return { ok: false, stage: '4', why: '1H跌破前波紅吞的低點',
+               whyKey: '1H跌破前波紅吞的低點' };
+    }
+    fibIdx1h = ei - 1;
+    h1Signal = `1H未破前波紅吞低點(${anchor1h.low})`;
+  }
+  const fib1h = bars1h[fibIdx1h];
 
   return { ok: true, signal: {
     strategy: 'A',
     price: curr1h.close, barTime: curr1h.time,
     d3Signal: agoBars === 0 ? `3D連${blackRun}黑轉紅` : `3D連${blackRun}黑轉紅（${agoBars}根前）`,
     d1Signal: `1D連${redRun.length}紅遞增過MA(${maVal})後轉黑（${blackAgo}根前，低${blackD.low}未破、${overAgo}根前過高${blackD.high}）`,
-    h3Signal: '3H前根收黑', h1Signal: '1H紅吞',
-    fibBar: { high: prev1h.high, low: prev1h.low, time: prev1h.time },
-    entryPrice: prev1h.high,     // 斐波那契 1
-    stopPrice: prev1h.low,       // 斐波那契 0
+    h3Signal: prevBlack3h ? '3H前根收黑' : '3H前根紅吞+當前收黑', h1Signal,
+    fibBar: { high: fib1h.high, low: fib1h.low, time: fib1h.time },
+    entryPrice: fib1h.high,     // 斐波那契 1
+    stopPrice: fib1h.low,       // 斐波那契 0
   } };
 }
 
@@ -737,7 +764,8 @@ async function checkEntry(tvSym) {
     // 策略B 條件3 要往回找「前面那根紅吞」，窗口太短會找不到而誤判，多抓一些
     const bars3h = await waitForChart(tvSym, '180', 3, 12);
     await switchTF('60');
-    const bars1h = await waitForChart(tvSym, '60', 3, 4);
+    // 策略A 條件4 當前不是紅吞時要往回找「前波紅吞」，窗口太短會誤判成沒有
+    const bars1h = await waitForChart(tvSym, '60', 3, 12);
 
     const data = { bars3d, barsD, maVal, bars3h, bars1h };
     const a = evalStrategyA(data);

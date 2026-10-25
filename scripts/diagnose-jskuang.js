@@ -120,30 +120,47 @@ async function main() {
     console.log(`         缺：${d1.why}（回報的是視窗內最近一根黑K 候選卡在哪）`);
   }
 
-  // ── 條件3：3H 前一根收黑K（當前這根不限型態）──
+  // ── 條件3：3H 前一根收黑K，或（前一根紅吞 且 當前收黑）──
   // 12 根：策略B 條件3 要往回找「前面最近一根紅吞」，窗口太短會誤判成沒有
   const bars3h = await loadBars(symbol, '180', 12);
   const curr3h = bars3h[bars3h.length - 1];
   const prev3h = bars3h[bars3h.length - 2];
-  const c3 = prev3h.close < prev3h.open;
+  const prevBlack3h = prev3h.close < prev3h.open;
+  const prevEngulfCurrBlack3h = bars3h.length >= 3
+    && isBullEngulf(prev3h, bars3h[bars3h.length - 3]) && curr3h.close < curr3h.open;
+  const c3 = prevBlack3h || prevEngulfCurrBlack3h;
   if (c3) passed++;
-  console.log(`\n${mark(c3)} 條件3  3H 前一根收黑K（當前這根不限型態）`);
+  console.log(`\n${mark(c3)} 條件3  3H 前一根收黑K 或（前一根紅吞 且 當前收黑）`);
   console.log(`         前一根 開${prev3h.open} 高${prev3h.high} 低${prev3h.low} 收${prev3h.close}（${color(prev3h)}K）`);
   console.log(`         當前   開${curr3h.open} 高${curr3h.high} 低${curr3h.low} 收${curr3h.close}（${color(curr3h)}K）`);
+  console.log(`         前一根收黑 ${mark(prevBlack3h)}　或　前根紅吞+當前收黑 ${mark(prevEngulfCurrBlack3h)}`);
 
-  // ── 條件4：1H 當前紅吞（不放寬）；進場停損由前一根的斐波那契決定 ──
-  const bars1h = await loadBars(symbol, '60', 4);
+  // ── 條件4：1H 當前紅吞；否則往前找紅吞且不得跌破它的低點 ──
+  // 12 根：要往回找「前波紅吞」，窗口太短會誤判成沒有
+  const bars1h = await loadBars(symbol, '60', 12);
   const curr1h = bars1h[bars1h.length - 1];
   const prev1h = bars1h[bars1h.length - 2];
   const engulf1h = isBullEngulf(curr1h, prev1h);
-  const c4 = engulf1h;
+  const ei1h = engulf1h ? -1 : findLastBullEngulfIdx(bars1h, bars1h.length - 2);
+  const anchor1h = ei1h >= 1 ? bars1h[ei1h] : null;
+  const holdLow1h = !!anchor1h && curr1h.low >= anchor1h.low;
+  const c4 = engulf1h || holdLow1h;
+  const fib1h = engulf1h ? prev1h : (anchor1h ? bars1h[ei1h - 1] : null);
   if (c4) passed++;
-  console.log(`\n${mark(c4)} 條件4  1H 當前紅吞（這關不放寬）`);
+  console.log(`\n${mark(c4)} 條件4  1H 當前紅吞，或 往前找紅吞且當前低點未跌破它的低點`);
   console.log(`         前一根 開${prev1h.open} 高${prev1h.high} 低${prev1h.low} 收${prev1h.close}（${color(prev1h)}K）`);
   console.log(`         當前   開${curr1h.open} 高${curr1h.high} 低${curr1h.low} 收${curr1h.close}（${color(curr1h)}K）`);
-  console.log(`         高點過前根 ${mark(curr1h.high > prev1h.high)}　自身收紅 ${mark(curr1h.close > curr1h.open)}`);
-  if (c4) {
-    console.log(`         → 進場 ${prev1h.high}（斐波那契 1）　停損 ${prev1h.low}（斐波那契 0）`);
+  console.log(`         當前紅吞 ${mark(engulf1h)}（高點過前根 ${mark(curr1h.high > prev1h.high)}　自身收紅 ${mark(curr1h.close > curr1h.open)}）`);
+  if (!engulf1h) {
+    if (!anchor1h) {
+      console.log(`         往前 ${bars1h.length - 1} 根找不到紅吞 —— 沒有錨點可比`);
+    } else {
+      console.log(`         前波紅吞在 ${bars1h.length - 1 - ei1h} 根前，低點 ${anchor1h.low}`);
+      console.log(`         當前低點 ${curr1h.low}　差 ${(curr1h.low - anchor1h.low).toFixed(8)}　未跌破 ${mark(holdLow1h)}`);
+    }
+  }
+  if (c4 && fib1h) {
+    console.log(`         → 進場 ${fib1h.high}（斐波那契 1）　停損 ${fib1h.low}（斐波那契 0）`);
   }
 
   console.log(`\n═══ 策略A 結果：符合 ${passed} / 4 項 ═══`);
