@@ -13,7 +13,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicket, openExposure, ensureTradingPanel, listPositions, rebuildPositionExits, setPositionSimpleExits } from './paper-order.js';
+import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicket, openExposure, ensureTradingPanel, listPositions, rebuildPositionExits, setPositionSimpleExits, chartLastPrice } from './paper-order.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const JOURNAL = path.join(ROOT, 'trades-jskuang.jsonl');
@@ -203,11 +203,29 @@ export async function placeSignalOrders({ symbol, plan, barTime, variant = null,
 
   // 回填訂單編號，之後過期取消要靠它對帳
   let orderIds = [];
-  if (!dryRun) {
+  let landed = null;
+  if (!dryRun && r.ok) {
+    // 送出鍵按下去不等於單進去了：placeLimitBracket 只看得到「畫面沒報錯」，
+    // 後端可以靜默拒單（實測：做多的限價掛在市價之上，模擬盤什麼都不建立，
+    // 畫面也沒有任何提示）。一定要讀回帳上實際狀態才算數。
+    const bare = symbol.split(':').pop();
     const live = await listOrders();
     orderIds = (live.rows || [])
-      .filter(r => r.symbol && r.symbol.indexOf(symbol.split(':').pop()) >= 0 && r.type === '限價' && r.orderId)
-      .map(r => r.orderId);
+      .filter(x => x.symbol && x.symbol.indexOf(bare) >= 0 && x.type === '限價' && x.orderId)
+      .map(x => x.orderId);
+    if (orderIds.length) {
+      landed = 'order';
+    } else {
+      // 限價單不在列上還有一種可能：立刻成交變成部位。那也算成功。
+      const pos = await listPositions();
+      const hit = (pos.rows || []).find(x => x.symbol && x.symbol.indexOf(bare) >= 0);
+      landed = hit ? 'position' : null;
+    }
+    if (!landed) {
+      const reason = '送出後帳上沒有這張單也沒有部位（後端靜默拒單）';
+      results.forEach(x => { x.ok = false; x.step = x.step || 'notLanded'; x.detail = x.detail || reason; });
+      await closeTicket();
+    }
   }
 
   const entry = {
@@ -217,7 +235,7 @@ export async function placeSignalOrders({ symbol, plan, barTime, variant = null,
     riskUSD: plan.riskUSD, actualRiskUSD: plan.actualRiskUSD, equity: plan.equity,
     riskPct: plan.riskPct, drawdown: plan.drawdown, riskReduced: plan.riskReduced,
     capped: plan.capped, dryRun, strategy: STRATEGY_VERSION, variant,
-    orders: results, orderIds,
+    orders: results, orderIds, landed,
     status: results.some(r => r.ok) ? 'placed' : 'failed',
   };
   appendJournal(entry);
@@ -425,6 +443,21 @@ export async function tradeSignal({ symbol, prevBar, fibBar = null, entryPrice =
 
   const plan = computePlan({ prevBar, fibBar, entryPrice, stopPrice, equity: acct.equity, available: acct.available });
   if (!plan.ok) return { ok: false, reason: plan.reason };
+
+  // 做多的限價掛在市價「之上」，模擬盤會靜默拒單 —— 什麼都不建立、畫面也沒有
+  // 任何提示，送出鍵照樣可按。2026-10-26 TAUSDT 連著六輪「下單成功」卻查無此單
+  // 就是這樣：進場 0.06177、市價 0.0582。實測把進場改到市價之下，同一套流程
+  // 立刻正常掛上（含四段停利停損）。
+  //
+  // 這種訊號在策略上是合理的（突破後追價），只是這個模擬盤不收。先擋下來並講清楚
+  // 原因，不要浪費一輪又留下一筆假的成交紀錄。
+  if (!dryRun) {
+    const last = await chartLastPrice();
+    if (last != null && plan.entry > last) {
+      return { skipped: true,
+               reason: `進場價 ${plan.entry} 高於現價 ${last}（高 ${((plan.entry / last - 1) * 100).toFixed(1)}%），模擬盤會拒收這種限價單` };
+    }
+  }
 
   const entry = await placeSignalOrders({ symbol, plan, barTime, variant, dryRun });
   return { ok: entry.status === 'placed', plan, entry };

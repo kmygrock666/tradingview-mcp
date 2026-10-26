@@ -1213,6 +1213,24 @@ export async function setPositionSimpleExits({ symbol, tp, stopPrice, posQty = n
 }
 
 /** 關閉訂單視窗（不送出） */
+/**
+ * 圖表主序列最後一根的收盤價 —— 也就是現價。
+ *
+ * 下單前要拿它跟進場價比：做多的限價掛在市價「之上」時，模擬盤會靜默拒單
+ * （什麼都不建立、畫面也沒提示），送出鍵照樣可按、函式照樣回成功。
+ * 呼叫端必須確保圖表正停在那個標的上（監控器下單時本來就是）。
+ */
+export async function chartLastPrice() {
+  return evaluate(`(function(){
+    try {
+      var bars = window.TradingViewApi._activeChartWidgetWV.value()
+        ._chartWidget.model().mainSeries().bars();
+      var last = bars.last();
+      return last ? last.value[4] : null;       // [time, O, H, L, C]
+    } catch (e) { return null; }
+  })()`);
+}
+
 export async function closeTicket() {
   return evaluateAsync(`(async function(){
     ${PAGE_HELPERS}
