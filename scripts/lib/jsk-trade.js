@@ -54,13 +54,21 @@ export function baseAsset(symbol) {
   return String(symbol).split(':').pop().replace(/\.P$/, '').replace(/USDT$|USD$|PERP$/, '');
 }
 
-/** 依數量級取合理的小數位，避免送出 1947.3333333 這種數字 */
+/**
+ * 依數量級取合理的小數位，避免送出 1947.3333333 這種數字。
+ *
+ * 小量一律只留 2 位：數量必須落在商品的步長上，超過的位數會被後端靜默拒單 ——
+ * 不報錯、畫面也沒提示，單就是不會出現。BNBUSDT 2026-10-26 連兩輪失敗就是
+ * 這樣：每批 0.342382（舊版對 <1 的數量給 6 位），實測改成 0.34 就立刻掛上。
+ *
+ * 2 位是保守值：常見的步長 0.01 / 0.001 都整除得了。真的遇到步長 0.1 或整數的
+ * 商品還是會被拒，但那時 placeSignalOrders 的落地驗證會把它記成 failed，
+ * 不會再假報成功。
+ */
 function roundQty(q) {
   if (!isFinite(q) || q <= 0) return 0;
   if (q >= 1000) return Math.round(q);
-  if (q >= 10) return Math.round(q * 100) / 100;
-  if (q >= 1) return Math.round(q * 1000) / 1000;
-  return Math.round(q * 1e6) / 1e6;
+  return Math.round(q * 100) / 100;
 }
 
 /**
@@ -147,7 +155,12 @@ function finishPlan({ entry, stop, targetPrices, equity, available }) {
   if (!targets.length) return { ok: false, reason: `所有停利價都不在進場價 ${entry} 之上` };
 
   const qtyEach = roundQty(qtyTotal / targets.length);
-  if (qtyEach <= 0) return { ok: false, reason: `算出的數量是 0（風險 ${riskUSD} / R ${R}）` };
+  // 每批取到小數 2 位（步長限制）後可能歸零 —— 高價商品配小風險就會這樣。
+  // 這是真的下不了單，要講清楚而不是送出去被靜默拒掉。
+  if (qtyEach <= 0) {
+    return { ok: false,
+             reason: `每批數量取到小數 2 位後是 0（風險 ${riskUSD} USD / R ${R}，總量 ${(riskUSD / R).toFixed(6)}）` };
+  }
 
   return {
     ok: true, entry, stop, R, targets,
