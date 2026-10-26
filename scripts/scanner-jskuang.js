@@ -4,14 +4,18 @@
  *
  * 策略條件（2026-10-26 改版，兩條擇一）：
  *   一、當前 18D 為「紅吞」（高點過前一根且自身收紅）
- *   二、前一根收黑，但收盤沒有跌破「它前面最近那根紅吞」的實體低點
+ *   二、前一根收黑，且三件事同時成立：
+ *         a. 收盤沒有跌破「它前一根」的實體低點
+ *         b. 最高點漲過「它前一根」的實體高點
+ *         c. 最近 3 根的低點逐根墊高
  *
- * 分支二看的是「收破」不是「觸及」，所以用收盤價比而不是最低點；紅吞自身收紅，
- * 實體低點就是它的開盤價。意思是回檔那根黑K 還守在前一波紅吞的實體之內，
- * 結構沒有被破壞 —— 跟分支一的「正在突破」互補，一個抓發動、一個抓守住。
+ * 分支二描述的是「回檔那根雖然收黑，但上緣已經探過前一根的實體、下緣也沒失守，
+ * 而且整體低點還在墊高」—— 蓄勢而非走弱，跟分支一的「正在發動」互補。
+ * a 用收盤價（「收破」才算），b 用最高點（「漲過」碰到就算）。
  *
  * 這組與監控器的移除條件（18D 黑吞出清）成對：跌破出清、重新站穩再找回來。
- * （2026-10-25 的舊條件是「現價收復上一根 18D 黑K 的實體」，已汰換。）
+ * 條件沿革：10-25「現價收復上一根 18D 黑K 實體」→ 10-26「紅吞 或 守住前面那根
+ * 紅吞的實體低點」→ 現在這版（參照點由「往回找的紅吞」改為單純的前一根）。
  *
  * 只收 BINGX 永續合約，符合的幣對透過 REST 指名加入「極速匡」清單
  * （與目前開啟的頁籤無關，清單中已有的會被略過）。
@@ -47,8 +51,11 @@ const TARGET_LIST = '極速匡';
 // 條件完全符合，但 24h 只漲 10.21%、在 665 個上漲合約裡排第 26，擠不進前 20。
 // 2026-10-26 由 20 放寬到 35。每多一名大約多 1 秒掃描時間。
 const TOP_N = 35;
-// 每個標的要抓的 18D K 棒數。分支二要往回找錨點紅吞，不能只抓最近幾根。
-const BARS_18D = 12;
+// 每個標的要抓的 18D K 棒數（判定只用到最近三根，多抓一點當緩衝）
+const BARS_18D = 6;
+// 分支二的「低點漸漸越來越高」要看最近幾根（嚴格遞增）。
+// 使用者沒給根數，取 3 —— 也就是「前兩根 → 前一根 → 當前」一路墊高。
+const ASCENDING_LOWS = 3;
 // 切換後的沉澱時間（ms）。資料是否就緒改由 waitForChart 輪詢判定，
 // 這裡只要讓 setSymbol/setResolution 有機會生效即可。
 // 連續這麼多個標的讀不到資料就中止：CDP 卡住時每個標的都會「無資料」，
@@ -73,50 +80,58 @@ const SCAN_TF = '18D';
 function isBullEngulf(c, p) {
   return c.high > p.high && c.close > c.open;
 }
-// 往回找最近一根紅吞的索引（從 fromIdx 起往前，找不到回 -1）
-function findLastBullEngulfIdx(bars, fromIdx) {
-  for (let i = Math.min(fromIdx, bars.length - 1); i >= 1; i--) {
-    if (isBullEngulf(bars[i], bars[i - 1])) return i;
-  }
-  return -1;
-}
+const bodyLowOf = (b) => Math.min(b.open, b.close);
+const bodyHighOf = (b) => Math.max(b.open, b.close);
 
 /**
  * 掃描條件（2026-10-26 改版，兩條擇一）：
  *   一、當前 18D 為「紅吞」
- *   二、前一根收黑，但收盤沒有跌破「它前面最近那根紅吞」的實體低點
+ *   二、前一根收黑，但三件事同時成立：
+ *         a. 收盤沒有跌破「它前一根」的實體低點
+ *         b. 最高點漲過「它前一根」的實體高點
+ *         c. 最近幾根的低點逐根墊高
  *
- * 分支二看的是「收破」不是「觸及」，所以用收盤價比，不用最低點；紅吞自身收紅，
- * 實體低點就是它的開盤價。意思是回檔那根黑K 還守在前一波紅吞的實體之內，
- * 結構沒有被破壞。
+ * 分支二的參照點是單純的「前一根」，不是往回找的紅吞（舊版是那樣，已汰換）。
+ * a 看的是「收破」不是「觸及」，所以用收盤價比而不是最低點；b 則是用最高點，
+ * 因為「漲過」是碰到就算。合起來描述的是：回檔那根雖然收黑，但上緣已經探過
+ * 前一根的實體、下緣也沒失守，而且整體低點還在墊高 —— 蓄勢而非走弱。
  */
 function checkReclaim(bars) {
-  if (bars.length < 3) return { pass: false, failedAt: '資料不足' };
+  if (bars.length < Math.max(3, ASCENDING_LOWS)) return { pass: false, failedAt: '資料不足' };
   const curr = bars[bars.length - 1];
   const prev = bars[bars.length - 2];
+  const pp = bars[bars.length - 3];     // 前一根的前一根＝分支二的參照
 
   // 分支一：當前紅吞
   if (isBullEngulf(curr, prev)) {
     return { pass: true, detail: `18D紅吞（高 ${curr.high} > 前根 ${prev.high}，收紅 ${curr.close}）` };
   }
 
-  // 分支二：前一根收黑，且收盤守住前面那根紅吞的實體低點
+  // 分支二
   if (!(prev.close < prev.open)) {
     return { pass: false, failedAt: '非紅吞且前一根不是黑K' };
   }
-  const ei = findLastBullEngulfIdx(bars, bars.length - 3);
-  if (ei < 0) {
-    return { pass: false, failedAt: '找不到錨點紅吞',
-             detail: `前 ${bars.length - 2} 根內沒有紅吞` };
+  const bLow = bodyLowOf(pp);
+  if (!(prev.close >= bLow)) {
+    return { pass: false, failedAt: '收破前根實體低點',
+             detail: `前一根收 ${prev.close} < 前根實體低 ${bLow}` };
   }
-  const anchor = bars[ei];
-  const bodyLow = Math.min(anchor.open, anchor.close);   // 紅吞收紅，實體低點＝開盤
-  if (!(prev.close >= bodyLow)) {
-    return { pass: false, failedAt: '收破紅吞實體低點',
-             detail: `前一根收 ${prev.close} < 紅吞實體低 ${bodyLow}` };
+  const bHigh = bodyHighOf(pp);
+  if (!(prev.high > bHigh)) {
+    return { pass: false, failedAt: '沒漲過前根實體高點',
+             detail: `前一根高 ${prev.high} ≤ 前根實體高 ${bHigh}` };
+  }
+  // 低點逐根墊高：看最近 ASCENDING_LOWS 根，嚴格遞增
+  const tail = bars.slice(-ASCENDING_LOWS);
+  for (let i = 1; i < tail.length; i++) {
+    if (!(tail[i].low > tail[i - 1].low)) {
+      return { pass: false, failedAt: '低點沒有逐根墊高',
+               detail: `最近 ${ASCENDING_LOWS} 根低點 ${tail.map(b => b.low).join(' → ')}` };
+    }
   }
   return { pass: true,
-           detail: `前一根黑K 收 ${prev.close} 守住 ${bars.length - 1 - ei} 根前紅吞的實體低 ${bodyLow}` };
+           detail: `前一根黑K 收 ${prev.close} ≥ 前根實體低 ${bLow}、高 ${prev.high} > 實體高 ${bHigh}，`
+                 + `低點 ${tail.map(b => b.low).join(' → ')} 逐根墊高` };
 }
 
 function formatTime(seconds) {
