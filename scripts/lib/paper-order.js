@@ -204,12 +204,30 @@ const PAGE_EXIT_LEVELS = `
     setInput(tail[0], qty); await sleep(500);
     setInput(tail[1], tp);  await sleep(400);
     setInput(tail[2], sl);  await sleep(400);
-    // 讀回來確認停利真的是我們填的價，不是被 ticks 模式吃掉變成別的數字
-    var back = levelInputs().slice(-3);
-    if (!back.length || Math.abs(parseFloat(back[1].value) - parseFloat(tp)) > Math.abs(tp) * 1e-6) {
-      return '停利填不進去（欄位顯示 ' + (back[1] ? back[1].value : '?') + '，預期 ' + tp + '）';
+
+    // 讀回來確認停利真的是我們填的價，不是被 ticks 模式吃掉變成別的數字。
+    //
+    // 要輪詢不能只看一眼：欄位是受控元件，填進去之後 TradingView 還會自己
+    // 重算與重新格式化，中間會短暫停在沒寫完的值上 —— BNBUSDT 就是這樣被判死，
+    // 欄位當下顯示 887.5、預期 887.53（tick 是 0.01，887.53 本來就合法，
+    // 用同一組價位重跑就過了）。等它穩定下來再判，還是不對才重填一次。
+    var matches = function () {
+      var b = levelInputs().slice(-3);
+      if (b.length < 2) return false;
+      return Math.abs(parseFloat(b[1].value) - parseFloat(tp)) <= Math.abs(tp) * 1e-6;
+    };
+    for (var attempt = 0; attempt < 2; attempt++) {
+      for (var w = 0; w < 10; w++) {        // 最多再等 2 秒
+        if (matches()) return null;
+        await sleep(200);
+      }
+      if (attempt === 0) {                   // 還是不對：重填一次再等
+        var again = levelInputs().slice(-3);
+        if (again.length >= 2) { setInput(again[1], tp); await sleep(400); }
+      }
     }
-    return null;
+    var shown = levelInputs().slice(-3)[1];
+    return '停利填不進去（欄位顯示 ' + (shown ? shown.value : '?') + '，預期 ' + tp + '）';
   }
   // 面板文字一律用換行切開再比對：這段程式會經過「JS 檔 → 樣板字串 → 頁面」
   // 三層字串，反斜線每層都會被吃掉一次，正則裡的 \\s、\\d 寫法極易悄悄失效。
