@@ -937,8 +937,18 @@ export async function rebuildPositionExits({ symbol, levels, stopPrice, posQty =
         var t = e.innerText || '';
         return t.length < 300 && t.indexOf('水平') === 0 && t.indexOf('TP ') >= 0;
       });
-      // 只留最內層那些列，並照畫面順序排（舊的在前、新加的在後）
-      return rows.filter(function(e){ return !rows.some(function(o){ return o !== e && e.contains(o); }); });
+      // 只留最內層那些列
+      var inner = rows.filter(function(e){ return !rows.some(function(o){ return o !== e && e.contains(o); }); });
+      // 同一層會被數到兩次：面板裡有兩份彼此不互相包含的列節點，內層過濾擋不掉
+      // （BULLAUSDT 實測 3 層數成 6 列）。以文字內容去重 —— 每一層的
+      // 「水平N + TP + SL」字串是唯一的。
+      var seen = {};
+      return inner.filter(function(e){
+        var k = (e.innerText || '').replace(/\s+/g, ' ').trim();
+        if (seen[k]) return false;
+        seen[k] = true;
+        return true;
+      });
     }
     function deleteRow(row) {
       var btns = Array.prototype.slice.call(row.querySelectorAll('button, [role="button"]'))
