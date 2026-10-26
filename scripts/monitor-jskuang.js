@@ -639,8 +639,8 @@ function evalStrategyA({ bars3d, barsD, maVal, bars3h, bars1h }) {
   const { blackRun, agoBars } = found;
 
   // 「曾連續收紅K、收盤遞增、某根高點過 MA 1，之後出一根黑K，後續未曾跌破
-  // 這根黑K 的低點、且曾漲過它的高點」。跟條件1 一樣用「曾」：黑K 不必是
-  // 最近那根。低點守住＝回檔還在控制中，高點被突破＝漲勢接回去了。
+  // 這根黑K 的低點、也未曾漲過它的高點」。跟條件1 一樣用「曾」：黑K 不必是
+  // 最近那根。高低兩端都還沒被突破＝價格仍收在那根黑K 的範圍內、盤整還沒表態。
   const d1 = findRedRunThenHold(barsD, maVal, LOOKBACK_1D);
   if (!d1.ok) return { ok: false, stage: '2', why: d1.why, whyKey: d1.whyKey };
   const { redRun, black: blackD, agoBars: blackAgo } = d1;
