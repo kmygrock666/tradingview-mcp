@@ -8,9 +8,9 @@
  *
  * 【A：破底後由黑轉紅】
  *   1. 3D：最近 5 根內曾「連續收黑K 之後出一根紅K」（轉紅那根不必是當前這根）
- *   2. 1D：最近 10 根內曾「連續收紅K 且收盤逐根遞增、其中某根高點突破 MA 1，
- *      之後出一根黑K」，且後續「未曾」跌破那根黑K 的低點、也「未曾」漲過它的高點
- *   3. 3H：前一根收黑K，或（前一根為「紅吞」且當前收黑）
+ *   2. 1D：最近 10 根內曾「連續收紅K 且收盤逐根遞增、其中某根高點突破 MA 1」，
+ *      之後的「首根未紅吞」那一根，當前價格仍落在它的高低範圍內
+ *   3. 3H：（前一根收黑K 或 前一根為「紅吞」且當前收黑）且 價格在 3H 的 MA 1 之上
  *   4. 1H：當前為「紅吞」；否則往前找最近一根紅吞，當前低點不得跌破它的低點
  *   進場＝斐波那契 1、停損＝斐波那契 0，錨在「那根紅吞的前一根」
  *   （當前就是紅吞時即前一根；走回看分支時則是那根紅吞的前一根）
@@ -181,29 +181,34 @@ function findBlackToRed(bars, lookback) {
 }
 
 // 在最近 lookback 根裡找策略A 條件2 的型態：
-//   連續收紅K（收盤遞增、其中某根高點過 MA）→ 出一根黑K
-//   → 後續「未曾」跌破那根黑K 的低點，也「未曾」漲過那根黑K 的高點
+//   連續收紅K（收盤遞增、其中某根高點過 MA）→ 之後的「首根未紅吞」
+//   → 當前價格仍落在那根的高低範圍內
 //
-// 那根黑K 是上升段裡的回檔，高低兩端都還沒被突破＝價格仍收在它的範圍內，
-// 盤整還沒表態。進場點由更小週期（條件3、4）去抓轉折，等於在突破發生之前卡位。
-// （這兩個判定都翻轉過：10-24 曾是「後續有跌破」，10-25 曾是「曾漲過高點」，
-//  都與現在相反，見 git 紀錄。）
+// 錨點是「漲勢停下來的第一根」：連續紅K 一路推高，直到某一根不再構成紅吞，
+// 那根就是回檔／停頓的起點。當前價格還在它的範圍內＝盤整還沒表態，
+// 進場時機交給更小週期（條件3、4）去抓。
 //
-// 黑K 可以是當前這根 —— 還沒有後續 K 棒，兩邊自然都還沒被突破。
-// 回傳最近成立的一組；不成立時 why 取「最近一根黑K 候選」卡在哪，卡關統計才有意義。
+// 「未紅吞」而不是「收黑」：緊接在連續紅K 之後的那根只要不是紅吞就算，
+// 收平、收紅但沒過前高都算（收黑自然也不可能是紅吞）。
+// 範圍判定看的是「現在的價格」，不是「後續每一根有沒有破」—— 後者是上一版
+// 的寫法，中途破了又回來就會被永久排除。
+//
+// 錨點可以是當前這根 —— 當前價格一定落在自己的範圍內。
+// 回傳最近成立的一組；不成立時 why 取「最近一根候選」卡在哪，卡關統計才有意義。
 //
 // 注意：maVal 是「現在」的 MA 值，拿去比對可能是好幾天前的紅K 高點。
 // 資料視窗只給得到當下的指標值，要精確就得另外抓 MA 的歷史序列。
 function findRedRunThenHold(bars, maVal, lookback) {
   const start = Math.max(1, bars.length - lookback);
+  const price = bars[bars.length - 1].close;
   // why 給人看（帶實際數字），whyKey 給卡關統計用（同類要能累加，不能把價格
   // 寫進去 —— 每個標的的價格都不一樣，統計就會變成一堆 ×1 的單筆）。
-  // 只記「最近那根黑K 候選」卡在哪；再往回的候選不覆寫它。
+  // 只記「最近那根候選」卡在哪；再往回的候選不覆寫它。
   let why = null, whyKey = null;
   const note = (msg, key) => { if (why === null) { why = msg; whyKey = key || msg; } };
   for (let k = bars.length - 1; k >= start; k--) {
-    const black = bars[k];
-    if (!(black.close < black.open)) continue;
+    const anchor = bars[k];
+    if (isBullEngulf(anchor, bars[k - 1])) continue;   // 還在紅吞＝漲勢沒停
 
     const redRun = [];
     for (let j = k - 1; j >= 0; j--) {
@@ -219,28 +224,16 @@ function findRedRunThenHold(bars, maVal, lookback) {
 
     if (!redRun.some(b => b.high > maVal)) { note('沒有任何紅K高點過MA'); continue; }
 
-    let brokenIdx = -1;
-    for (let j = k + 1; j < bars.length; j++) {
-      if (bars[j].low < black.low) { brokenIdx = j; break; }
-    }
-    if (brokenIdx >= 0) {
-      note(`後續跌破黑K低點 ${black.low}（${bars.length - 1 - brokenIdx}根前）`, '後續跌破黑K低點');
+    if (!(price >= anchor.low && price <= anchor.high)) {
+      note(`現價 ${price} 不在首根未紅吞的範圍 ${anchor.low}~${anchor.high} 內`,
+           '現價不在首根未紅吞的範圍內');
       continue;
     }
 
-    let overIdx = -1;
-    for (let j = k + 1; j < bars.length; j++) {
-      if (bars[j].high > black.high) { overIdx = j; break; }
-    }
-    if (overIdx >= 0) {
-      note(`後續漲過黑K高點 ${black.high}（${bars.length - 1 - overIdx}根前）`, '後續漲過黑K高點');
-      continue;
-    }
-
-    return { ok: true, redRun, black, blackIdx: k,
-             agoBars: bars.length - 1 - k, heldBars: bars.length - 1 - k };
+    return { ok: true, redRun, anchor, anchorIdx: k, price,
+             agoBars: bars.length - 1 - k };
   }
-  const fallback = `前${lookback}根內沒有黑K`;
+  const fallback = `前${lookback}根內找不到「連續紅K 後的首根未紅吞」`;
   return { ok: false, why: why || fallback, whyKey: whyKey || fallback };
 }
 
@@ -625,7 +618,7 @@ async function checkRemoval18D(tvSym) {
 // 回傳 { ok:true, signal } 或 { ok:false, stage, why }。
 
 /** A：破底後由黑轉紅 */
-function evalStrategyA({ bars3d, barsD, maVal, bars3h, bars1h }) {
+function evalStrategyA({ bars3d, barsD, maVal, maVal3h, bars3h, bars1h }) {
   // 「前 5 根內曾連續收黑K後出一根紅K」—— 轉紅那根不必是當前這根，只要這個
   // 型態出現在最近 LOOKBACK_3D 根之內就算數。之前要求當前必須是紅K，等於
   // 只接受「剛好這一根轉紅」的瞬間，錯過就得等下一輪，大多數標的卡死在這關。
@@ -638,15 +631,14 @@ function evalStrategyA({ bars3d, barsD, maVal, bars3h, bars1h }) {
   }
   const { blackRun, agoBars } = found;
 
-  // 「曾連續收紅K、收盤遞增、某根高點過 MA 1，之後出一根黑K，後續未曾跌破
-  // 這根黑K 的低點、也未曾漲過它的高點」。跟條件1 一樣用「曾」：黑K 不必是
-  // 最近那根。高低兩端都還沒被突破＝價格仍收在那根黑K 的範圍內、盤整還沒表態。
+  // 「曾連續收紅K、收盤遞增、某根高點過 MA 1，之後的首根未紅吞，當前價格
+  // 仍落在那根的高低範圍內」。跟條件1 一樣用「曾」：那根不必是最近一根。
   const d1 = findRedRunThenHold(barsD, maVal, LOOKBACK_1D);
   if (!d1.ok) return { ok: false, stage: '2', why: d1.why, whyKey: d1.whyKey };
-  const { redRun, black: blackD, agoBars: blackAgo } = d1;
+  const { redRun, anchor: anchorD, agoBars: anchorAgo } = d1;
 
-  // 條件3：前一根收黑 或（前一根是紅吞 且 當前收黑）。
-  // 後者是「紅吞之後拉回一根黑K」—— 一樣是回檔，只是回檔那根出現在當前。
+  // 條件3：（前一根收黑 或 前一根紅吞且當前收黑）且 價格在 3H 的 MA 1 之上。
+  // 前半是回檔，差別只在回檔那根出現在前一根還是當前；後半是大方向過濾。
   const curr3h = bars3h[bars3h.length - 1];
   const prev3h = bars3h[bars3h.length - 2];
   const prevBlack3h = prev3h.close < prev3h.open;
@@ -655,6 +647,14 @@ function evalStrategyA({ bars3d, barsD, maVal, bars3h, bars1h }) {
     && curr3h.close < curr3h.open;
   if (!prevBlack3h && !prevEngulfCurrBlack3h) {
     return { ok: false, stage: '3', why: '3H前一根不是黑K、也不是「前根紅吞+當前收黑」' };
+  }
+  // MA 跟著週期走，這裡一定要用 3H 上讀到的值，不能沿用 1D 的
+  if (!(maVal3h > 0)) {
+    return { ok: false, stage: '3', why: '3H的MA讀不到', whyKey: '3H的MA讀不到' };
+  }
+  if (!(curr3h.close > maVal3h)) {
+    return { ok: false, stage: '3', why: `3H價格 ${curr3h.close} 不在MA ${maVal3h} 之上`,
+             whyKey: '3H價格不在MA之上' };
   }
 
   // 條件4：當前紅吞 → 斐波那契錨在前一根；
@@ -686,8 +686,8 @@ function evalStrategyA({ bars3d, barsD, maVal, bars3h, bars1h }) {
     strategy: 'A',
     price: curr1h.close, barTime: curr1h.time,
     d3Signal: agoBars === 0 ? `3D連${blackRun}黑轉紅` : `3D連${blackRun}黑轉紅（${agoBars}根前）`,
-    d1Signal: `1D連${redRun.length}紅遞增過MA(${maVal})後轉黑（${blackAgo}根前，高${blackD.high}低${blackD.low}兩端皆未破）`,
-    h3Signal: prevBlack3h ? '3H前根收黑' : '3H前根紅吞+當前收黑', h1Signal,
+    d1Signal: `1D連${redRun.length}紅遞增過MA(${maVal})後首根未紅吞（${anchorAgo}根前，現價在 ${anchorD.low}~${anchorD.high} 內）`,
+    h3Signal: `${prevBlack3h ? '3H前根收黑' : '3H前根紅吞+當前收黑'}且價在MA(${maVal3h})上`, h1Signal,
     fibBar: { high: fib1h.high, low: fib1h.low, time: fib1h.time },
     entryPrice: fib1h.high,     // 斐波那契 1
     stopPrice: fib1h.low,       // 斐波那契 0
@@ -766,11 +766,14 @@ async function checkEntry(tvSym) {
     await switchTF('180');
     // 策略B 條件3 要往回找「前面那根紅吞」，窗口太短會找不到而誤判，多抓一些
     const bars3h = await waitForChart(tvSym, '180', 3, 12);
+    // 策略A 條件3 要比「價格在 MA 1 之上」，而 MA 是跟著週期走的 ——
+    // 1D 讀到的值不能拿來當 3H 的 MA，必須在 3H 上重讀一次。
+    const maVal3h = await waitForMaValue();
     await switchTF('60');
     // 策略A 條件4 當前不是紅吞時要往回找「前波紅吞」，窗口太短會誤判成沒有
     const bars1h = await waitForChart(tvSym, '60', 3, 12);
 
-    const data = { bars3d, barsD, maVal, bars3h, bars1h };
+    const data = { bars3d, barsD, maVal, maVal3h, bars3h, bars1h };
     const a = evalStrategyA(data);
     if (a.ok) return { symbol: tvSym, displayName, ...a.signal };
     const b = evalStrategyB(data);

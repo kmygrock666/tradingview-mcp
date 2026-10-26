@@ -109,13 +109,13 @@ async function main() {
   const d1 = findRedRunThenHold(barsD, ma, LOOKBACK_1D);
   const c2 = d1.ok;
   if (c2) passed++;
-  console.log(`\n${mark(c2)} 條件2  最近 ${LOOKBACK_1D} 根 1D 內曾連續紅K 遞增且某根高點過 MA 後出黑K，且後續未跌破它的低點、也未漲過它的高點`);
+  console.log(`\n${mark(c2)} 條件2  最近 ${LOOKBACK_1D} 根 1D 內曾連續紅K 遞增且某根高點過 MA 後出黑K，之後的首根未紅吞，現價仍在它的範圍內`);
   console.log(`         最近 ${barsD.length} 根 1D：${barsD.slice(-10).map(color).join(' ')}`);
   console.log(`         當前 開${currD.open} 收${currD.close}（${color(currD)}K）　MA 1 = ${Number.isFinite(ma) ? ma : '讀不到'}`);
   if (c2) {
     console.log(`         連續紅K ${d1.redRun.length} 根：收盤 ${d1.redRun.map(b => b.close).join(' → ')}（最高 ${Math.max(...d1.redRun.map(b => b.high))} > MA）`);
-    console.log(`         黑K 在 ${d1.agoBars} 根前（開${d1.black.open} 收${d1.black.close} 高${d1.black.high} 低${d1.black.low}）`);
-    console.log(`         之後都沒跌破低點 ${d1.black.low}，也都沒漲過高點 ${d1.black.high}`);
+    console.log(`         首根未紅吞在 ${d1.agoBars} 根前（開${d1.anchor.open} 收${d1.anchor.close} 高${d1.anchor.high} 低${d1.anchor.low}）`);
+    console.log(`         現價 ${d1.price} 落在它的範圍 ${d1.anchor.low}~${d1.anchor.high} 內`);
   } else {
     console.log(`         缺：${d1.why}（回報的是視窗內最近一根黑K 候選卡在哪）`);
   }
@@ -128,12 +128,17 @@ async function main() {
   const prevBlack3h = prev3h.close < prev3h.open;
   const prevEngulfCurrBlack3h = bars3h.length >= 3
     && isBullEngulf(prev3h, bars3h[bars3h.length - 3]) && curr3h.close < curr3h.open;
-  const c3 = prevBlack3h || prevEngulfCurrBlack3h;
+  // MA 跟著週期走 —— 條件3 要比的是 3H 上的 MA，不能沿用條件2 讀到的 1D 值
+  const ma3h = await readMa();
+  const pattern3h = prevBlack3h || prevEngulfCurrBlack3h;
+  const aboveMa3h = Number.isFinite(ma3h) && curr3h.close > ma3h;
+  const c3 = pattern3h && aboveMa3h;
   if (c3) passed++;
-  console.log(`\n${mark(c3)} 條件3  3H 前一根收黑K 或（前一根紅吞 且 當前收黑）`);
+  console.log(`\n${mark(c3)} 條件3  3H（前一根收黑K 或 前一根紅吞且當前收黑）且 價格在 MA 1 之上`);
   console.log(`         前一根 開${prev3h.open} 高${prev3h.high} 低${prev3h.low} 收${prev3h.close}（${color(prev3h)}K）`);
   console.log(`         當前   開${curr3h.open} 高${curr3h.high} 低${curr3h.low} 收${curr3h.close}（${color(curr3h)}K）`);
-  console.log(`         前一根收黑 ${mark(prevBlack3h)}　或　前根紅吞+當前收黑 ${mark(prevEngulfCurrBlack3h)}`);
+  console.log(`         前一根收黑 ${mark(prevBlack3h)}　或　前根紅吞+當前收黑 ${mark(prevEngulfCurrBlack3h)}　→ 型態 ${mark(pattern3h)}`);
+  console.log(`         3H MA 1 = ${Number.isFinite(ma3h) ? ma3h : '讀不到'}　現價 ${curr3h.close} 在MA之上 ${mark(aboveMa3h)}`);
 
   // ── 條件4：1H 當前紅吞；否則往前找紅吞且不得跌破它的低點 ──
   // 12 根：要往回找「前波紅吞」，窗口太短會誤判成沒有
