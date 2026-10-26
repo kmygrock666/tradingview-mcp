@@ -2,13 +2,16 @@
 /**
  * 極速匡策略掃描器
  *
- * 策略條件（2026-10-25 改版，只有一條）：
- *   上一根（已完成）的 18D 為黑K，且現價已經突破該根的開盤價
- *   —— 也就是完全收復那根 18D 黑K 的實體。
+ * 策略條件（2026-10-26 改版，兩條擇一）：
+ *   一、當前 18D 為「紅吞」（高點過前一根且自身收紅）
+ *   二、前一根收黑，但收盤沒有跌破「它前面最近那根紅吞」的實體低點
  *
- * 黑K 的實體上緣就是開盤價（收盤 < 開盤），所以「過實體」＝現價 > 開盤價。
- * 看的是「上一根」而非當前這根：當前 18D 還在走，型態隨時會變。
- * 這條與監控器的移除條件（18D 黑吞出清）剛好成對：跌破出清、收復找回來。
+ * 分支二看的是「收破」不是「觸及」，所以用收盤價比而不是最低點；紅吞自身收紅，
+ * 實體低點就是它的開盤價。意思是回檔那根黑K 還守在前一波紅吞的實體之內，
+ * 結構沒有被破壞 —— 跟分支一的「正在突破」互補，一個抓發動、一個抓守住。
+ *
+ * 這組與監控器的移除條件（18D 黑吞出清）成對：跌破出清、重新站穩再找回來。
+ * （2026-10-25 的舊條件是「現價收復上一根 18D 黑K 的實體」，已汰換。）
  *
  * 只收 BINGX 永續合約，符合的幣對透過 REST 指名加入「極速匡」清單
  * （與目前開啟的頁籤無關，清單中已有的會被略過）。
@@ -44,6 +47,8 @@ const TARGET_LIST = '極速匡';
 // 條件完全符合，但 24h 只漲 10.21%、在 665 個上漲合約裡排第 26，擠不進前 20。
 // 2026-10-26 由 20 放寬到 35。每多一名大約多 1 秒掃描時間。
 const TOP_N = 35;
+// 每個標的要抓的 18D K 棒數。分支二要往回找錨點紅吞，不能只抓最近幾根。
+const BARS_18D = 12;
 // 切換後的沉澱時間（ms）。資料是否就緒改由 waitForChart 輪詢判定，
 // 這裡只要讓 setSymbol/setResolution 有機會生效即可。
 // 連續這麼多個標的讀不到資料就中止：CDP 卡住時每個標的都會「無資料」，
@@ -64,16 +69,54 @@ const SCAN_TF = '18D';
  * 上一根 18D 是黑K，且現價過了它的實體上緣（開盤價）。
  * 回傳 { pass, failedAt?, detail? }，detail 讓通知可以直接被覆核。
  */
-function checkReclaim(bars) {
-  if (bars.length < 2) return { pass: false, failedAt: '資料不足' };
-  const prev = bars[bars.length - 2];          // 已完成的那一根
-  const price = bars[bars.length - 1].close;   // 當前這根的收盤＝現價
-  if (!(prev.close < prev.open)) return { pass: false, failedAt: '上一根不是黑K' };
-  if (!(price > prev.open)) {
-    return { pass: false, failedAt: '未過實體',
-             detail: `現價 ${price} ≤ 開盤 ${prev.open}` };
+// 紅吞：當前漲過前一根的高點且自身收紅（與監控器同一套定義，不限前一根顏色）
+function isBullEngulf(c, p) {
+  return c.high > p.high && c.close > c.open;
+}
+// 往回找最近一根紅吞的索引（從 fromIdx 起往前，找不到回 -1）
+function findLastBullEngulfIdx(bars, fromIdx) {
+  for (let i = Math.min(fromIdx, bars.length - 1); i >= 1; i--) {
+    if (isBullEngulf(bars[i], bars[i - 1])) return i;
   }
-  return { pass: true, detail: `現價 ${price} > 18D黑K開盤 ${prev.open}（實體已收復）` };
+  return -1;
+}
+
+/**
+ * 掃描條件（2026-10-26 改版，兩條擇一）：
+ *   一、當前 18D 為「紅吞」
+ *   二、前一根收黑，但收盤沒有跌破「它前面最近那根紅吞」的實體低點
+ *
+ * 分支二看的是「收破」不是「觸及」，所以用收盤價比，不用最低點；紅吞自身收紅，
+ * 實體低點就是它的開盤價。意思是回檔那根黑K 還守在前一波紅吞的實體之內，
+ * 結構沒有被破壞。
+ */
+function checkReclaim(bars) {
+  if (bars.length < 3) return { pass: false, failedAt: '資料不足' };
+  const curr = bars[bars.length - 1];
+  const prev = bars[bars.length - 2];
+
+  // 分支一：當前紅吞
+  if (isBullEngulf(curr, prev)) {
+    return { pass: true, detail: `18D紅吞（高 ${curr.high} > 前根 ${prev.high}，收紅 ${curr.close}）` };
+  }
+
+  // 分支二：前一根收黑，且收盤守住前面那根紅吞的實體低點
+  if (!(prev.close < prev.open)) {
+    return { pass: false, failedAt: '非紅吞且前一根不是黑K' };
+  }
+  const ei = findLastBullEngulfIdx(bars, bars.length - 3);
+  if (ei < 0) {
+    return { pass: false, failedAt: '找不到錨點紅吞',
+             detail: `前 ${bars.length - 2} 根內沒有紅吞` };
+  }
+  const anchor = bars[ei];
+  const bodyLow = Math.min(anchor.open, anchor.close);   // 紅吞收紅，實體低點＝開盤
+  if (!(prev.close >= bodyLow)) {
+    return { pass: false, failedAt: '收破紅吞實體低點',
+             detail: `前一根收 ${prev.close} < 紅吞實體低 ${bodyLow}` };
+  }
+  return { pass: true,
+           detail: `前一根黑K 收 ${prev.close} 守住 ${bars.length - 1 - ei} 根前紅吞的實體低 ${bodyLow}` };
 }
 
 function formatTime(seconds) {
@@ -169,7 +212,9 @@ async function waitForChart(symbol, tf, minBars = 2, timeoutMs = LOAD_TIMEOUT) {
     last = state;
     if (state && state.symbol === symbol && state.interval === wantTf) {
       try {
-        const result = await getOhlcv({ count: 3 });
+        // 12 根：分支二要往回找「前一根黑K 之前最近的那根紅吞」當錨點，
+        // 窗口太短會把「找不到錨點」誤報成條件不符
+        const result = await getOhlcv({ count: BARS_18D });
         const bars = result?.bars || [];
         seen = bars.length;
         const spacingOk = bars.length >= 2 && (!wantSec || bars[1].time - bars[0].time === wantSec);
@@ -192,7 +237,8 @@ async function scanSymbol(tvSymbol) {
 
     let bars;
     try {
-      bars = await waitForChart(tvSymbol, SCAN_TF);
+      // 至少 3 根：判定要用到當前、前一根，分支二還要再往前找錨點
+      bars = await waitForChart(tvSymbol, SCAN_TF, 3);
     } catch {
       // 新上市幣對常常沒有足夠的 18D 歷史，這是資料問題不是條件不符
       return { pass: false, failedAt: SCAN_TF, reason: 'no_data' };
