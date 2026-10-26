@@ -142,7 +142,9 @@ async function main() {
 
   // ── 條件4：1H 當前紅吞；否則往前找紅吞且不得跌破它的低點 ──
   // 12 根：要往回找「前波紅吞」，窗口太短會誤判成沒有
-  const bars1h = await loadBars(symbol, '60', 12);
+  const bars1h = await loadBars(symbol, "60", 12);
+  // 策略B 條件5 要比 1H 的 MA —— 跟 1D/3H 的值都不一樣，得在 1H 上自己讀
+  const ma1h = await readMa();
   const curr1h = bars1h[bars1h.length - 1];
   const prev1h = bars1h[bars1h.length - 2];
   const engulf1h = isBullEngulf(curr1h, prev1h);
@@ -220,24 +222,32 @@ async function main() {
     console.log(`         當前低點 ${curr3h.low}　差 ${(curr3h.low - anchor3h.low).toFixed(8)}`);
   }
 
-  // ── B條件4：1H 當前紅吞 或 自身收黑 ──
-  const black1h = curr1h.close < curr1h.open;
-  const b4 = engulf1h || black1h;
+  // ── B條件4：1H 當前紅吞，否則往前找紅吞（只為了定錨點）──
+  const bEi = engulf1h ? -1 : findLastBullEngulfIdx(bars1h, bars1h.length - 2);
+  const b4 = engulf1h || bEi >= 1;
+  const bFib = engulf1h ? prev1h : (bEi >= 1 ? bars1h[bEi - 1] : null);
   if (b4) passedB++;
-  console.log(`\n${mark(b4)} B條件4  1H 當前紅吞 或 自身收黑（擇一即可，並用前一根拉斐波那契）`);
+  console.log(`\n${mark(b4)} B條件4  1H 當前紅吞，否則往前找紅吞（斐波那契錨在「那根紅吞的前一根」）`);
   console.log(`         前一根 高${prev1h.high} 低${prev1h.low} 收${prev1h.close}（${color(prev1h)}K）`);
   console.log(`         當前   高${curr1h.high} 低${curr1h.low} 收${curr1h.close}（${color(curr1h)}K）`);
-  console.log(`         當前紅吞 ${mark(engulf1h)}　或　自身收黑 ${mark(black1h)}`);
-  if (b4) {
-    console.log(`         → 進場 ${prev1h.high}（斐波那契 1）　停損 ${prev1h.low}（斐波那契 0）`);
+  console.log(`         當前紅吞 ${mark(engulf1h)}` +
+    (engulf1h ? '' : `　往前找到紅吞 ${mark(bEi >= 1)}` + (bEi >= 1 ? `（${bars1h.length - 1 - bEi} 根前）` : '')));
+  if (b4 && bFib) {
+    console.log(`         → 進場 ${bFib.high}（斐波那契 1）　停損 ${bFib.low}（斐波那契 0）`);
   }
 
-  console.log(`\n═══ 策略B 結果：符合 ${passedB} / 4 項 ═══`);
-  if (passedB < 4) {
-    const missB = [!b1 && '1', !b2 && '2', !b3 && '3', !b4 && '4'].filter(Boolean);
+  // ── B條件5：1H 當前價格站上 MA 1 ──
+  const b5 = Number.isFinite(ma1h) && curr1h.close > ma1h;
+  if (b5) passedB++;
+  console.log(`\n${mark(b5)} B條件5  1H 當前價格站上 MA 1`);
+  console.log(`         1H MA 1 = ${Number.isFinite(ma1h) ? ma1h : '讀不到'}　現價 ${curr1h.close}　差 ${Number.isFinite(ma1h) ? (curr1h.close - ma1h).toFixed(8) : '-'}`);
+
+  console.log(`\n═══ 策略B 結果：符合 ${passedB} / 5 項 ═══`);
+  if (passedB < 5) {
+    const missB = [!b1 && '1', !b2 && '2', !b3 && '3', !b4 && '4', !b5 && '5'].filter(Boolean);
     console.log(`差在條件 ${missB.join('、')}\n`);
   } else {
-    console.log('四關全過 —— 監控器下一輪就會下單\n');
+    console.log('五關全過 —— 監控器下一輪就會下單\n');
   }
 
   await disconnect();

@@ -20,8 +20,9 @@
  *   2. 1D：(當前紅吞 且 低點不低於前一根 且 高點過 MA 1) 或 (前 2 根以上皆為紅吞)
  *   3. 3H：當前不限型態（紅吞／收黑／收紅皆可），但低點不得跌破「前面
  *      最近一根紅吞」的低點
- *   4. 1H：當前為「紅吞」或自身收黑（擇一），用前一根拉斐波那契
- *   進場＝斐波那契 1（前一根高點），停損＝斐波那契 0（前一根低點）
+ *   4. 1H：當前為「紅吞」；否則往前找最近一根紅吞（只為了定錨點）
+ *   5. 1H：當前價格站上 1H 的 MA 1
+ *   進場＝斐波那契 1、停損＝斐波那契 0，錨在「那根紅吞的前一根」
  *
  *   兩組共用同一次圖表載入（分開跑會讓每輪時間加倍），A 先判、A 不過才判 B。
  *   停利一律是斐波那契四段 10.8 / 20.8 / 30.8 / 50.8，各 1/4 部位。
@@ -695,7 +696,7 @@ function evalStrategyA({ bars3d, barsD, maVal, maVal3h, bars3h, bars1h }) {
 }
 
 /** B：突破後進場 */
-function evalStrategyB({ bars3d, barsD, maVal, bars3h, bars1h }) {
+function evalStrategyB({ bars3d, barsD, maVal, maVal1h, bars3h, bars1h }) {
   const curr3d = bars3d[bars3d.length - 1];
   const prev3d = bars3d[bars3d.length - 2];
   if (!isBullEngulf(curr3d, prev3d)) return { ok: false, stage: '1', why: '3D不是紅吞' };
@@ -727,22 +728,45 @@ function evalStrategyB({ bars3d, barsD, maVal, bars3h, bars1h }) {
   const anchor3h = bars3h[anchorIdx3h];
   if (!(curr3h.low >= anchor3h.low)) return { ok: false, stage: '3', why: '3H跌破前面紅吞的低點' };
 
-  // 當前紅吞 或 自身收黑，擇一即可；斐波那契錨在前一根（1=高點、0=低點）
+  // 條件4：當前紅吞 → 斐波那契錨在前一根；否則往前找最近一根紅吞，
+  // 錨在「那根紅吞的前一根」。與策略A 的條件4 同形，差別是這裡不再額外要求
+  // 「沒跌破前波紅吞低點」—— 那個把關已經由條件3 在 3H 上做過了。
   const curr1h = bars1h[bars1h.length - 1];
   const prev1h = bars1h[bars1h.length - 2];
-  const engulf1h = isBullEngulf(curr1h, prev1h);
-  const black1h = curr1h.close < curr1h.open;
-  if (!engulf1h && !black1h) return { ok: false, stage: '4', why: '1H既不是紅吞、自身也不是黑K' };
+  let fibIdx1h, h1Signal;
+  if (isBullEngulf(curr1h, prev1h)) {
+    fibIdx1h = bars1h.length - 2;
+    h1Signal = '1H紅吞';
+  } else {
+    const ei = findLastBullEngulfIdx(bars1h, bars1h.length - 2);
+    if (ei < 1) {
+      return { ok: false, stage: '4', why: `1H不是紅吞，往前${bars1h.length - 1}根也找不到紅吞`,
+               whyKey: '1H不是紅吞且往前找不到紅吞' };
+    }
+    fibIdx1h = ei - 1;
+    h1Signal = `1H前波紅吞(${bars1h.length - 1 - ei}根前)`;
+  }
+  const fib1h = bars1h[fibIdx1h];
+
+  // 條件5：1H 價格站上 MA 1。MA 跟著週期走，用的是 1H 上讀到的值。
+  if (!(maVal1h > 0)) {
+    return { ok: false, stage: '5', why: '1H的MA讀不到', whyKey: '1H的MA讀不到' };
+  }
+  if (!(curr1h.close > maVal1h)) {
+    return { ok: false, stage: '5', why: `1H價格 ${curr1h.close} 沒站上MA ${maVal1h}`,
+             whyKey: '1H價格沒站上MA' };
+  }
 
   return { ok: true, signal: {
     strategy: 'B',
     price: curr1h.close, barTime: curr1h.time,
     d3Signal: '3D紅吞',
     d1Signal: d1a ? `1D紅吞不破前低且高點過MA(${maVal})` : `1D前${bullRun}根紅吞`,
-    h3Signal: `未破前面紅吞低點(${anchor3h.low})`, h1Signal: engulf1h ? '1H紅吞' : '1H收黑',
-    fibBar: { high: prev1h.high, low: prev1h.low, time: prev1h.time },
-    entryPrice: prev1h.high,     // 斐波那契 1
-    stopPrice: prev1h.low,       // 斐波那契 0
+    h3Signal: `未破前面紅吞低點(${anchor3h.low})`,
+    h1Signal: `${h1Signal}且站上MA(${maVal1h})`,
+    fibBar: { high: fib1h.high, low: fib1h.low, time: fib1h.time },
+    entryPrice: fib1h.high,     // 斐波那契 1
+    stopPrice: fib1h.low,       // 斐波那契 0
   } };
 }
 
@@ -770,10 +794,12 @@ async function checkEntry(tvSym) {
     // 1D 讀到的值不能拿來當 3H 的 MA，必須在 3H 上重讀一次。
     const maVal3h = await waitForMaValue();
     await switchTF('60');
-    // 策略A 條件4 當前不是紅吞時要往回找「前波紅吞」，窗口太短會誤判成沒有
+    // 兩組策略的條件4 當前不是紅吞時都要往回找「前波紅吞」，窗口太短會誤判成沒有
     const bars1h = await waitForChart(tvSym, '60', 3, 12);
+    // 策略B 條件5 要比「價格站上 MA 1」，一樣得在 1H 上自己讀一次
+    const maVal1h = await waitForMaValue();
 
-    const data = { bars3d, barsD, maVal, maVal3h, bars3h, bars1h };
+    const data = { bars3d, barsD, maVal, maVal3h, maVal1h, bars3h, bars1h };
     const a = evalStrategyA(data);
     if (a.ok) return { symbol: tvSym, displayName, ...a.signal };
     const b = evalStrategyB(data);
