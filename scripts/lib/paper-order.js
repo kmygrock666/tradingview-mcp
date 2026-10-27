@@ -975,58 +975,106 @@ export async function rebuildPositionExits({ symbol, levels, stopPrice, posQty =
       log.push('先刪掉全額層：保護 ' + protectionPct() + '%');
     }
 
-    // 照原本的停利價加上新的層，只有停損換成新的。
+    // ── 等面板安定下來再讀 ───────────────────────────────
     //
-    // TradingView 每個部位最多 4 層，滿了之後「新增水平」就靜靜地沒反應 ——
-    // 不報錯、也不新增，setExpandedLevel 於是反覆覆寫同一層，四段停利最後
-    // 只剩頭尾。所以每加一層都要確認保護倉位大小真的變大了；沒變大就表示
-    // 名額被舊的殘層（例如前置切出來的 0.01% 碎片）佔著，刪掉一層再試一次。
-    // 判斷「真的新增了一層」要在寫值之前做：新增成功時，原本展開的那層會收合，
-    // 收合列數因此 +1。等到寫完值才發現沒新增就來不及了 —— setExpandedLevel
-    // 已經把上一層的停利覆蓋掉，那一段目標價就永遠消失了。
-    for (var i = 0; i < p.levels.length; i++) {
-      var added = false;
-      for (var attempt = 0; attempt < 2 && !added; attempt++) {
-        if (!levelsPanel()) return fail('add', '面板不見了（第 ' + (i + 1) + ' 層）');
-        var rowsBefore = levelRows().length;
-        if (!clickAddLevel(levelsPanel())) return fail('add', '第 ' + (i + 1) + ' 層新增失敗');
-        await sleep(900);
-        if (levelRows().length > rowsBefore) { added = true; break; }
+    // 這整段的核心教訓：每次加刪之後 TradingView 會重算、重排、重繪，過程中
+    // 讀到的數字是半成品。追蹤紀錄裡保護倉位大小一路跳 99.99 → 66.66 →
+    // 33.33 → 133.33，列表還會短暫出現重複列 —— 先前所有「加不進去」「保護
+    // 不是 100%」的誤判都來自讀太早。固定 sleep 擋不住，改成輪詢到連續兩次
+    // 讀數相同才採信。
+    async function settle() {
+      var prev = null;
+      for (var t = 0; t < 25; t++) {        // 最多等 5 秒
+        await sleep(200);
+        var now = protectionPct() + '/' + levelRows().length;
+        if (now === prev) return;
+        prev = now;
+      }
+    }
+    // 展開中那層還沒填值，不算在保護倉位大小裡 —— 要判斷「真的新增了一層」
+    // 只能看有沒有可填的展開層，不能看列數或百分比。
+    function hasExpanded() { return levelInputs().length >= 3; }
+    // 舊層與新層靠停損價分辨：換好的層帶的是新停損。
+    // 不能用位置分辨 —— 面板是依停利價排序的，不是依新增順序。
+    function rowHasPrice(row, price) {
+      var target = parseFloat(price);
+      if (!isFinite(target)) return false;
+      var tol = Math.max(1e-9, Math.abs(target) * 1e-6);
+      return (row.innerText || '').split(',').join('').split(/[^0-9.]+/)
+        .map(parseFloat).filter(isFinite)
+        .some(function(n){ return Math.abs(n - target) <= tol; });
+    }
+    function findStaleRow() {
+      var rows = levelRows();
+      for (var r = 0; r < rows.length; r++) {
+        if (!rowHasPrice(rows[r], p.stopPrice)) return rows[r];
+      }
+      return null;
+    }
 
-        // 沒加進去＝名額滿了（上限 4 層）。刪掉最前面那層殘層空出名額再試一次。
-        // 這時還沒寫任何值，所以重試不會弄丟前一層的停利。
-        var stale = levelRows()[0];
-        if (attempt === 0 && stale && deleteRow(stale)) {
-          await sleep(900);
-          log.push('第 ' + (i + 1) + ' 層名額滿了，刪一層殘層後重試');
-          continue;
+    // ── 一層一層換：先刪一層舊的空出額度，再加一層新的 ──
+    //
+    // 順序不能顛倒。面板只肯在「還有未分配數量」時新增：部位被既有的層分滿
+    // （保護 99.99%）就點不動「新增水平」，不報錯也沒反應。舊版是「先全部加完
+    // 再刪舊的」，第一步就卡死 —— BULLA / HAEDAL / REZ 的移動停損連續失敗
+    // 都是這樣。刪到最後一層時面板會退回基本編輯器，而先刪再加剛好避開：
+    // 刪一層後立刻補一層回去。
+    var oldLeft = origCount;
+    for (var i = 0; i < p.levels.length; i++) {
+      if (oldLeft > 0) {
+        // deleteRow 回報成功不代表真的刪掉了（點到的刪除鈕有時沒作用），
+        // 要讀回列數確認。不確認的話後面會以為還有空間可以新增，實際上
+        // 保護倉位大小已經滿了，新增就靜靜失效（REZ 走到第 3 層時 133.33%）。
+        var removed = false;
+        for (var da = 0; da < 2 && !removed; da++) {
+          var before = levelRows().length;
+          var victim = findStaleRow();
+          if (!victim || !deleteRow(victim)) break;
+          await settle();
+          removed = levelRows().length < before;
         }
-        return fail('add', '第 ' + (i + 1) + ' 層加不進去（收合列數停在 ' + rowsBefore + '）');
+        if (!removed) {
+          return fail('delete', '刪不掉舊水平（還剩 ' + oldLeft + ' 層，保護 ' + protectionPct() + '%）');
+        }
+        oldLeft--;
+      }
+      if (!levelsPanel()) return fail('add', '面板不見了（第 ' + (i + 1) + ' 層）');
+      // 新增成功與否要分兩種情況判斷，單看 hasExpanded() 會被騙：
+      //   · 本來就沒有展開層 → 新增後必須出現一個
+      //   · 本來就有展開層（上一圈填完還留著）→ 新增成功時它會「收合」，
+      //     收合列數因此 +1；新增失敗時它仍然展開著，hasExpanded() 照樣為真，
+      //     接下來的 setExpandedLevel 就會把上一層的停利覆寫掉 ——
+      //     三層只剩頭尾、中間那段目標價憑空消失（REZ 0.006189、BULLA 0.19479）。
+      var hadExpanded = hasExpanded();
+      var rowsBeforeAdd = levelRows().length;
+      if (!clickAddLevel(levelsPanel())) return fail('add', '第 ' + (i + 1) + ' 層新增失敗');
+      await settle();
+      var reallyAdded = hadExpanded
+        ? levelRows().length > rowsBeforeAdd     // 上一層有收合＝真的多了一層
+        : hasExpanded();
+      if (!reallyAdded || !hasExpanded()) {
+        return fail('add', '第 ' + (i + 1) + ' 層加不進去（收合列數 ' + rowsBeforeAdd
+                  + '→' + levelRows().length + '，保護 ' + protectionPct() + '%）');
       }
       var err = await setExpandedLevel(each, p.levels[i].tp, p.stopPrice);
       if (err) return fail('set', '第 ' + (i + 1) + ' 層設定失敗：' + err);
-      log.push('水平' + (i + 1) + ' ' + each + ' @ TP ' + p.levels[i].tp + ' / SL ' + p.stopPrice);
+      await settle();
+      log.push('換上水平' + (i + 1) + ' ' + each + ' @ TP ' + p.levels[i].tp + ' / SL ' + p.stopPrice
+             + '（保護 ' + protectionPct() + '%）');
     }
 
-    log.push('加完新層：共 ' + levelRows().length + ' 層、保護 ' + protectionPct() + '%');
-
-    // 新的加好了，把原本那幾層刪掉（它們固定排在前面）。
-    //
-    // 結束條件看「保護倉位大小」不看列數：levelRows() 只認得收合且帶 TP 的列，
-    // 展開中的那層、以及只有停損沒有停利的層都數不到，拿列數當門檻會提早跳出
-    // ——「原有 1 層、加 4 層、結果數到 3 層」就是這樣來的，一層都沒刪就離開，
-    // 保護停在 150%。百分比是面板自己算的，不受列數偵測的死角影響。
-    var deleted = 0;
+    // 收尾：把剩下的舊層刪到保護剛好 100%。
+    // 只刪「停損價不是新值」的列，才不會誤刪剛換上的層。
+    var deleted = origCount - oldLeft;
     for (var d2 = 0; d2 < origCount + p.levels.length + 3; d2++) {
       var pctNow = protectionPct();
       if (!isFinite(pctNow) || pctNow <= 100 + 1) break;
-      var rowsNow = levelRows();
-      if (!rowsNow.length) break;
-      if (!deleteRow(rowsNow[0])) return fail('delete', '刪不掉舊水平（保護 ' + pctNow + '%）');
+      var rest = findStaleRow();
+      if (!rest || !deleteRow(rest)) break;
       deleted++;
-      await sleep(900);
+      await settle();
     }
-    log.push('刪除 ' + deleted + ' 層後：共 ' + levelRows().length + ' 層、保護 ' + protectionPct() + '%');
+    log.push('換掉 ' + deleted + ' 層舊水平後：共 ' + levelRows().length + ' 層、保護 ' + protectionPct() + '%');
 
     var pct = protectionPct();
     if (!(Math.abs(pct - 100) < 1.5)) {
