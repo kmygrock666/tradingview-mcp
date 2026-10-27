@@ -21,7 +21,7 @@ const MAIN_SERIES = `${CHART_API}._chartWidget.model().mainSeries()`;
 const TF_SECONDS = { '60': 3600, '180': 10800, 'D': 86400, '3D': 259200 };
 const MIN_RUN = 2;
 const LOOKBACK_3D = 5;
-const LOOKBACK_1D = 10;
+const LOOKBACK_1D = 5;
 const MA_STUDY_NAME = '7EMA_5MA';
 const MA_VALUE_KEY = 'MA 1';
 
