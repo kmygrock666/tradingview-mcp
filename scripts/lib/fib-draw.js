@@ -118,6 +118,39 @@ export async function drawEntryFib({ fibBar, targets = [], tag = '' }) {
   return { ok: true, id: res.id };
 }
 
+/**
+ * 清掉「我們自己畫的」斐波那契，使用者手動拉的不動。
+ *
+ * 用在標的已經沒有單也沒有部位的時候：那條線對應的交易結束了，留著只會讓
+ * 之後的訊號被「圖上已有斐波那契」跳過，而且圖面會一路累積。
+ *
+ * 怎麼分辨是不是我們畫的：看層級的文字標籤。我們一定會寫上「進場」「停損」
+ * 與「TP n R」，使用者自己拉的不會有這些字。只比形狀名稱不夠 —— 那會把
+ * 使用者的線一起刪掉。
+ *
+ * @returns {Promise<number>} 刪掉幾條
+ */
+export async function clearOurFib() {
+  return evaluate(`(function(){
+    var api = ${API};
+    var n = 0;
+    api.getAllShapes().forEach(function(s){
+      if (s.name !== 'fib_retracement') return;
+      try {
+        var p = api.getShapeById(s.id).getProperties();
+        var ours = false;
+        for (var i = 1; i <= 24; i++) {
+          var lv = p['level' + i];
+          var txt = (lv && lv[3]) || '';
+          if (/進場|停損|TP /.test(txt)) { ours = true; break; }
+        }
+        if (ours) { api.removeEntity(s.id); n++; }
+      } catch (e) { /* 讀不到屬性就當成不是我們的，寧可不刪 */ }
+    });
+    return n;
+  })()`);
+}
+
 /** 清掉圖上所有繪圖（換標的前用，避免一路累積） */
 export async function clearDrawings() {
   return evaluate(`(function(){

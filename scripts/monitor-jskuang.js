@@ -63,8 +63,9 @@
 import { connect, disconnect, evaluate, evaluateAsync, getTargetInfo } from '../src/connection.js';
 import { getOhlcv, getStudyValues } from '../src/core/data.js';
 import { removeFromList } from '../src/core/watchlist.js';
-import { tradeSignal, expireStaleOrders, trailStops, ORDER_TTL_MS, DRAWDOWN_TRIGGER, RISK_PCT_REDUCED } from './lib/jsk-trade.js';
-import { drawEntryFib } from './lib/fib-draw.js';
+import { tradeSignal, expireStaleOrders, trailStops, baseAsset, ORDER_TTL_MS, DRAWDOWN_TRIGGER, RISK_PCT_REDUCED } from './lib/jsk-trade.js';
+import { drawEntryFib, clearOurFib } from './lib/fib-draw.js';
+import { openExposure } from './lib/paper-order.js';
 
 // 自動載入專案根目錄的 .env(已用 export 設定或檔案不存在時略過)
 try { process.loadEnvFile(new URL('../.env', import.meta.url)); } catch {}
@@ -876,9 +877,21 @@ async function runScan() {
     for (const s of removeNotified) if (!jskSymbols.has(s)) removeNotified.delete(s);
   }
 
+  // 本輪還有單或有部位的幣（以幣名為準，跨交易所同幣視為同一個）。
+  // 用來清掉已經沒有交易的標的留下的斐波那契 —— 讀一次就好，不要每個標的查。
+  // 讀失敗就給 null，代表「不確定」，那就這輪都不清，不要亂刪。
+  let liveBases = null;
+  if (TRADING_ENABLED) {
+    try {
+      const ex = await openExposure();
+      if (ex.ok) liveBases = new Set((ex.symbols || []).map(s => baseAsset(s)));
+    } catch { /* 讀不到就維持 null */ }
+  }
+
   const signals = [];
   const rejections = new Map();   // 卡關統計：'條件2：紅K收盤沒遞增' → 次數
   const removals = [];
+  let fibCleared = 0;
   const errors = [];         // 單一幣對的例外，彙總進本輪摘要
   const scanned = new Set(); // 同一輪跨清單去重：同幣對只掃一次
   for (const { list, symbols } of lists) {
@@ -908,6 +921,16 @@ async function runScan() {
       }
       scanned.add(tvSym);
       const result = await checkEntry(tvSym);
+
+      // 這個標的已經沒有單也沒有部位，就把當初那筆交易畫的斐波那契清掉。
+      // 趁現在做：checkEntry 剛跑完，圖表正停在這個標的上，不必另外切換。
+      // 只刪我們自己畫的（看層級文字標籤），使用者手動拉的不動。
+      if (liveBases && !liveBases.has(baseAsset(tvSym))) {
+        try {
+          const n = await clearOurFib();
+          if (n) { fibCleared += n; process.stdout.write(`🧹 清掉 ${n} 條舊斐波那契 `); }
+        } catch { /* 清不掉不影響本輪判定 */ }
+      }
       if (result?.rejected) {
         for (const [tag, r] of [['A', result.a], ['B', result.b]]) {
           // 統計要用 whyKey（不含價格等各標的不同的數字），否則同一個原因會
@@ -1002,6 +1025,8 @@ async function runScan() {
       console.error('  ⚠️  移除失敗（下次掃描將重試）:', e.message);
     }
   }
+
+  if (fibCleared) console.log(`\n  🧹 本輪清掉 ${fibCleared} 條已結束交易的斐波那契`);
 
   // 卡關統計：由多到少，看得出該鬆哪一關
   const rejSorted = [...rejections.entries()].sort((a, b) => b[1] - a[1]);
