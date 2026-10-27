@@ -18,11 +18,10 @@
  * 【B：突破後進場】
  *   1. 3D：當前為「紅吞」
  *   2. 1D：(當前紅吞 且 低點不低於前一根 且 高點過 MA 1) 或 (前 2 根以上皆為紅吞)
- *   3. 3H：當前低點不得跌破「前一根」的低點
- *   4. 3H：當前不限型態（紅吞／收黑／收紅皆可），但低點不得跌破「前面
- *      最近一根紅吞」的低點
- *   5. 1H：當前為「紅吞」；否則往前找最近一根紅吞（只為了定錨點）
- *   6. 1H：當前價格站上 1H 的 MA 1
+ *   3. 3H：當前不限型態（紅吞／收黑／收紅皆可），但低點不得跌破「前面
+ *      最近一根紅吞」的實體低點（影線戳破不算）
+ *   4. 1H：當前為「紅吞」；否則往前找最近一根紅吞（只為了定錨點）
+ *   5. 1H：當前價格站上 1H 的 MA 1
  *   進場＝斐波那契 1（現價已過它就改用現價），停損＝斐波那契 0，
  *   錨在「那根紅吞的前一根」
  *
@@ -723,27 +722,24 @@ function evalStrategyB({ bars3d, barsD, maVal, maVal1h, bars3h, bars1h }) {
   }
 
   const curr3h = bars3h[bars3h.length - 1];
-  const prev3h = bars3h[bars3h.length - 2];
 
-  // 條件3：當前 3H 的低點不得跌破「前一根」的低點 —— 最近一根就不能走弱。
-  // 與條件4 的差別在錨點遠近：這裡比的是緊鄰的前一根，條件4 比的是更前面
-  // 那根紅吞，一個看短期、一個看結構。
-  if (!(curr3h.low >= prev3h.low)) {
-    return { ok: false, stage: '3', why: '3H跌破前一根的低點', whyKey: '3H跌破前一根的低點' };
-  }
-
-  // 條件4：當前這根是紅吞／收黑／收紅都可以（三者涵蓋所有 K 棒，等於不限
-  // 型態），真正的要求只有一個：不能跌破「前面那根紅吞」的低點 —— 那根紅吞
-  // 是突破結構的錨點，低點被破就代表突破失敗。
+  // 條件3：當前這根是紅吞／收黑／收紅都可以（三者涵蓋所有 K 棒，等於不限
+  // 型態），真正的要求只有一個：不能跌破「前面那根紅吞」的實體低點 ——
+  // 那根紅吞是突破結構的錨點，實體被吃掉就代表突破失敗。
+  // 比的是實體低點不是最低點：影線戳破不算（紅吞收紅，實體低點＝開盤價）。
   const anchorIdx3h = findLastBullEngulfIdx(bars3h, bars3h.length - 2);
-  if (anchorIdx3h < 0) return { ok: false, stage: '4', why: `3H前面${bars3h.length - 1}根內沒有紅吞`,
+  if (anchorIdx3h < 0) return { ok: false, stage: '3', why: `3H前面${bars3h.length - 1}根內沒有紅吞`,
                                 whyKey: '3H前面找不到紅吞' };
   const anchor3h = bars3h[anchorIdx3h];
-  if (!(curr3h.low >= anchor3h.low)) return { ok: false, stage: '4', why: '3H跌破前面紅吞的低點' };
+  const anchorBodyLow3h = Math.min(anchor3h.open, anchor3h.close);
+  if (!(curr3h.low >= anchorBodyLow3h)) {
+    return { ok: false, stage: '3', why: `3H跌破前面紅吞的實體低點 ${anchorBodyLow3h}`,
+             whyKey: '3H跌破前面紅吞的實體低點' };
+  }
 
-  // 條件5：當前紅吞 → 斐波那契錨在前一根；否則往前找最近一根紅吞，
+  // 條件4：當前紅吞 → 斐波那契錨在前一根；否則往前找最近一根紅吞，
   // 錨在「那根紅吞的前一根」。與策略A 的條件4 同形，差別是這裡不再額外要求
-  // 「沒跌破前波紅吞低點」—— 那個把關已經由條件3、4 在 3H 上做過了。
+  // 「沒跌破前波紅吞低點」—— 那個把關已經由條件3 在 3H 上做過了。
   const curr1h = bars1h[bars1h.length - 1];
   const prev1h = bars1h[bars1h.length - 2];
   let fibIdx1h, h1Signal;
@@ -753,7 +749,7 @@ function evalStrategyB({ bars3d, barsD, maVal, maVal1h, bars3h, bars1h }) {
   } else {
     const ei = findLastBullEngulfIdx(bars1h, bars1h.length - 2);
     if (ei < 1) {
-      return { ok: false, stage: "5", why: `1H不是紅吞，往前${bars1h.length - 1}根也找不到紅吞`,
+      return { ok: false, stage: "4", why: `1H不是紅吞，往前${bars1h.length - 1}根也找不到紅吞`,
                whyKey: '1H不是紅吞且往前找不到紅吞' };
     }
     fibIdx1h = ei - 1;
@@ -761,12 +757,12 @@ function evalStrategyB({ bars3d, barsD, maVal, maVal1h, bars3h, bars1h }) {
   }
   const fib1h = bars1h[fibIdx1h];
 
-  // 條件6：1H 價格站上 MA 1。MA 跟著週期走，用的是 1H 上讀到的值。
+  // 條件5：1H 價格站上 MA 1。MA 跟著週期走，用的是 1H 上讀到的值。
   if (!(maVal1h > 0)) {
-    return { ok: false, stage: '6', why: '1H的MA讀不到', whyKey: '1H的MA讀不到' };
+    return { ok: false, stage: "5", why: "1H的MA讀不到", whyKey: "1H的MA讀不到" };
   }
   if (!(curr1h.close > maVal1h)) {
-    return { ok: false, stage: '6', why: `1H價格 ${curr1h.close} 沒站上MA ${maVal1h}`,
+    return { ok: false, stage: "5", why: `1H價格 ${curr1h.close} 沒站上MA ${maVal1h}`,
              whyKey: '1H價格沒站上MA' };
   }
 
@@ -779,7 +775,7 @@ function evalStrategyB({ bars3d, barsD, maVal, maVal1h, bars3h, bars1h }) {
     price: curr1h.close, barTime: curr1h.time,
     d3Signal: '3D紅吞',
     d1Signal: d1a ? `1D紅吞不破前低且高點過MA(${maVal})` : `1D前${bullRun}根紅吞`,
-    h3Signal: `未破前根低(${prev3h.low})與前面紅吞低(${anchor3h.low})`,
+    h3Signal: `未破前面紅吞實體低(${anchorBodyLow3h})`,
     h1Signal: `${h1Signal}且站上MA(${maVal1h})`,
     fibBar: { high: fib1h.high, low: fib1h.low, time: fib1h.time },
     entryPrice: chased ? curr1h.close : fib1h.high,   // 斐波那契 1，過了就用現價

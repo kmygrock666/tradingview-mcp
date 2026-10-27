@@ -209,54 +209,50 @@ async function main() {
   console.log(`         型態一：當前紅吞 ${mark(dEngulf)}　低點不低於前根 ${mark(dHoldLow)}（${currD.low} vs ${prevD.low}）　高點過MA ${mark(dOverMa)}（${currD.high} vs ${ma}）`);
   console.log(`         型態二：往前連續紅吞 ${bullRun} 根（要 ≥${MIN_RUN}）${mark(b2b)}`);
 
-  // ── B條件3：3H 當前低點不得跌破「前一根」的低點 ──
-  const b3 = curr3h.low >= prev3h.low;
-  if (b3) passedB++;
-  console.log(`\n${mark(b3)} B條件3  3H 當前低點不得跌破前一根的低點`);
-  console.log(`         前一根低點 ${prev3h.low}　當前低點 ${curr3h.low}　差 ${(curr3h.low - prev3h.low).toFixed(8)}`);
-
-  // ── B條件4：3H 低點不得跌破「前面最近一根紅吞」的低點 ──
+  // ── B條件3：3H 低點不得跌破「前面最近一根紅吞」的實體低點 ──
   const anchorIdx = findLastBullEngulfIdx(bars3h, bars3h.length - 2);
   const anchor3h = anchorIdx >= 0 ? bars3h[anchorIdx] : null;
-  const b4 = !!anchor3h && curr3h.low >= anchor3h.low;
-  if (b4) passedB++;
-  console.log(`\n${mark(b4)} B條件4  3H 當前不限型態，但低點不得跌破前面最近一根紅吞的低點`);
+  // 紅吞收紅，實體低點＝開盤價；比實體不比最低點，影線戳破不算
+  const anchorBodyLow = anchor3h ? Math.min(anchor3h.open, anchor3h.close) : null;
+  const b3 = !!anchor3h && curr3h.low >= anchorBodyLow;
+  if (b3) passedB++;
+  console.log(`\n${mark(b3)} B條件3  3H 當前不限型態，但低點不得跌破前面最近一根紅吞的實體低點`);
   if (!anchor3h) {
     console.log(`         前 ${bars3h.length - 1} 根內找不到紅吞 —— 沒有錨點可比`);
   } else {
-    console.log(`         錨點紅吞在 ${bars3h.length - 1 - anchorIdx} 根前，低點 ${anchor3h.low}`);
-    console.log(`         當前低點 ${curr3h.low}　差 ${(curr3h.low - anchor3h.low).toFixed(8)}`);
+    console.log(`         錨點紅吞在 ${bars3h.length - 1 - anchorIdx} 根前（開${anchor3h.open} 收${anchor3h.close} 低${anchor3h.low}）　實體低 ${anchorBodyLow}`);
+    console.log(`         當前低點 ${curr3h.low}　差 ${(curr3h.low - anchorBodyLow).toFixed(8)}`);
   }
 
-  // ── B條件5：1H 當前紅吞，否則往前找紅吞（只為了定錨點）──
+  // ── B條件4：1H 當前紅吞，否則往前找紅吞（只為了定錨點）──
   const bEi = engulf1h ? -1 : findLastBullEngulfIdx(bars1h, bars1h.length - 2);
-  const b5 = engulf1h || bEi >= 1;
+  const b4 = engulf1h || bEi >= 1;
   const bFib = engulf1h ? prev1h : (bEi >= 1 ? bars1h[bEi - 1] : null);
-  if (b5) passedB++;
-  console.log(`\n${mark(b5)} B條件5  1H 當前紅吞，否則往前找紅吞（斐波那契錨在「那根紅吞的前一根」）`);
+  if (b4) passedB++;
+  console.log(`\n${mark(b4)} B條件4  1H 當前紅吞，否則往前找紅吞（斐波那契錨在「那根紅吞的前一根」）`);
   console.log(`         前一根 高${prev1h.high} 低${prev1h.low} 收${prev1h.close}（${color(prev1h)}K）`);
   console.log(`         當前   高${curr1h.high} 低${curr1h.low} 收${curr1h.close}（${color(curr1h)}K）`);
   console.log(`         當前紅吞 ${mark(engulf1h)}` +
     (engulf1h ? '' : `　往前找到紅吞 ${mark(bEi >= 1)}` + (bEi >= 1 ? `（${bars1h.length - 1 - bEi} 根前）` : '')));
-  if (b5 && bFib) {
+  if (b4 && bFib) {
     // 進場原則上掛斐波那契 1；現價已經過它就不等回踩，直接用現價
     const chased = curr1h.close > bFib.high;
     console.log(`         → 進場 ${chased ? curr1h.close : bFib.high}（斐波那契 1 = ${bFib.high}`
       + `${chased ? `，現價已過它，改用現價` : ''}）　停損 ${bFib.low}（斐波那契 0）`);
   }
 
-  // ── B條件6：1H 當前價格站上 MA 1 ──
-  const b6 = Number.isFinite(ma1h) && curr1h.close > ma1h;
-  if (b6) passedB++;
-  console.log(`\n${mark(b6)} B條件6  1H 當前價格站上 MA 1`);
+  // ── B條件5：1H 當前價格站上 MA 1 ──
+  const b5 = Number.isFinite(ma1h) && curr1h.close > ma1h;
+  if (b5) passedB++;
+  console.log(`\n${mark(b5)} B條件5  1H 當前價格站上 MA 1`);
   console.log(`         1H MA 1 = ${Number.isFinite(ma1h) ? ma1h : '讀不到'}　現價 ${curr1h.close}　差 ${Number.isFinite(ma1h) ? (curr1h.close - ma1h).toFixed(8) : '-'}`);
 
-  console.log(`\n═══ 策略B 結果：符合 ${passedB} / 6 項 ═══`);
-  if (passedB < 6) {
-    const missB = [!b1 && '1', !b2 && '2', !b3 && '3', !b4 && '4', !b5 && '5', !b6 && '6'].filter(Boolean);
+  console.log(`\n═══ 策略B 結果：符合 ${passedB} / 5 項 ═══`);
+  if (passedB < 5) {
+    const missB = [!b1 && '1', !b2 && '2', !b3 && '3', !b4 && '4', !b5 && '5'].filter(Boolean);
     console.log(`差在條件 ${missB.join('、')}\n`);
   } else {
-    console.log('六關全過 —— 監控器下一輪就會下單\n');
+    console.log('五關全過 —— 監控器下一輪就會下單\n');
   }
 
   await disconnect();
