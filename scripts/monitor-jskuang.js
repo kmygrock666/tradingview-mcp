@@ -18,11 +18,13 @@
  * 【B：突破後進場】
  *   1. 3D：當前為「紅吞」
  *   2. 1D：(當前紅吞 且 低點不低於前一根 且 高點過 MA 1) 或 (前 2 根以上皆為紅吞)
- *   3. 3H：當前不限型態（紅吞／收黑／收紅皆可），但低點不得跌破「前面
+ *   3. 3H：當前低點不得跌破「前一根」的低點
+ *   4. 3H：當前不限型態（紅吞／收黑／收紅皆可），但低點不得跌破「前面
  *      最近一根紅吞」的低點
- *   4. 1H：當前為「紅吞」；否則往前找最近一根紅吞（只為了定錨點）
- *   5. 1H：當前價格站上 1H 的 MA 1
- *   進場＝斐波那契 1、停損＝斐波那契 0，錨在「那根紅吞的前一根」
+ *   5. 1H：當前為「紅吞」；否則往前找最近一根紅吞（只為了定錨點）
+ *   6. 1H：當前價格站上 1H 的 MA 1
+ *   進場＝斐波那契 1（現價已過它就改用現價），停損＝斐波那契 0，
+ *   錨在「那根紅吞的前一根」
  *
  *   兩組共用同一次圖表載入（分開跑會讓每輪時間加倍），A 先判、A 不過才判 B。
  *   停利一律是斐波那契四段 10.8 / 20.8 / 30.8 / 50.8，各 1/4 部位。
@@ -721,17 +723,27 @@ function evalStrategyB({ bars3d, barsD, maVal, maVal1h, bars3h, bars1h }) {
   }
 
   const curr3h = bars3h[bars3h.length - 1];
-  // 當前這根是紅吞／收黑／收紅都可以（三者涵蓋所有 K 棒，等於不限型態），
-  // 真正的要求只有一個：不能跌破「前面那根紅吞」的低點 —— 那根紅吞是突破
-  // 結構的錨點，低點被破就代表突破失敗。
-  const anchorIdx3h = findLastBullEngulfIdx(bars3h, bars3h.length - 2);
-  if (anchorIdx3h < 0) return { ok: false, stage: '3', why: `3H前面${bars3h.length - 1}根內沒有紅吞` };
-  const anchor3h = bars3h[anchorIdx3h];
-  if (!(curr3h.low >= anchor3h.low)) return { ok: false, stage: '3', why: '3H跌破前面紅吞的低點' };
+  const prev3h = bars3h[bars3h.length - 2];
 
-  // 條件4：當前紅吞 → 斐波那契錨在前一根；否則往前找最近一根紅吞，
+  // 條件3：當前 3H 的低點不得跌破「前一根」的低點 —— 最近一根就不能走弱。
+  // 與條件4 的差別在錨點遠近：這裡比的是緊鄰的前一根，條件4 比的是更前面
+  // 那根紅吞，一個看短期、一個看結構。
+  if (!(curr3h.low >= prev3h.low)) {
+    return { ok: false, stage: '3', why: '3H跌破前一根的低點', whyKey: '3H跌破前一根的低點' };
+  }
+
+  // 條件4：當前這根是紅吞／收黑／收紅都可以（三者涵蓋所有 K 棒，等於不限
+  // 型態），真正的要求只有一個：不能跌破「前面那根紅吞」的低點 —— 那根紅吞
+  // 是突破結構的錨點，低點被破就代表突破失敗。
+  const anchorIdx3h = findLastBullEngulfIdx(bars3h, bars3h.length - 2);
+  if (anchorIdx3h < 0) return { ok: false, stage: '4', why: `3H前面${bars3h.length - 1}根內沒有紅吞`,
+                                whyKey: '3H前面找不到紅吞' };
+  const anchor3h = bars3h[anchorIdx3h];
+  if (!(curr3h.low >= anchor3h.low)) return { ok: false, stage: '4', why: '3H跌破前面紅吞的低點' };
+
+  // 條件5：當前紅吞 → 斐波那契錨在前一根；否則往前找最近一根紅吞，
   // 錨在「那根紅吞的前一根」。與策略A 的條件4 同形，差別是這裡不再額外要求
-  // 「沒跌破前波紅吞低點」—— 那個把關已經由條件3 在 3H 上做過了。
+  // 「沒跌破前波紅吞低點」—— 那個把關已經由條件3、4 在 3H 上做過了。
   const curr1h = bars1h[bars1h.length - 1];
   const prev1h = bars1h[bars1h.length - 2];
   let fibIdx1h, h1Signal;
@@ -741,7 +753,7 @@ function evalStrategyB({ bars3d, barsD, maVal, maVal1h, bars3h, bars1h }) {
   } else {
     const ei = findLastBullEngulfIdx(bars1h, bars1h.length - 2);
     if (ei < 1) {
-      return { ok: false, stage: '4', why: `1H不是紅吞，往前${bars1h.length - 1}根也找不到紅吞`,
+      return { ok: false, stage: "5", why: `1H不是紅吞，往前${bars1h.length - 1}根也找不到紅吞`,
                whyKey: '1H不是紅吞且往前找不到紅吞' };
     }
     fibIdx1h = ei - 1;
@@ -749,25 +761,30 @@ function evalStrategyB({ bars3d, barsD, maVal, maVal1h, bars3h, bars1h }) {
   }
   const fib1h = bars1h[fibIdx1h];
 
-  // 條件5：1H 價格站上 MA 1。MA 跟著週期走，用的是 1H 上讀到的值。
+  // 條件6：1H 價格站上 MA 1。MA 跟著週期走，用的是 1H 上讀到的值。
   if (!(maVal1h > 0)) {
-    return { ok: false, stage: '5', why: '1H的MA讀不到', whyKey: '1H的MA讀不到' };
+    return { ok: false, stage: '6', why: '1H的MA讀不到', whyKey: '1H的MA讀不到' };
   }
   if (!(curr1h.close > maVal1h)) {
-    return { ok: false, stage: '5', why: `1H價格 ${curr1h.close} 沒站上MA ${maVal1h}`,
+    return { ok: false, stage: '6', why: `1H價格 ${curr1h.close} 沒站上MA ${maVal1h}`,
              whyKey: '1H價格沒站上MA' };
   }
 
+  // 進場價：原則上掛斐波那契 1 等回踩；但價格已經漲過它就不等了，直接用現價。
+  // 錯過的突破追不回來，而且限價掛在現價之上模擬盤會靜默拒單。
+  // 停利仍由 fibBar 的區間決定，不隨進場價移動。
+  const chased = curr1h.close > fib1h.high;
   return { ok: true, signal: {
     strategy: 'B',
     price: curr1h.close, barTime: curr1h.time,
     d3Signal: '3D紅吞',
     d1Signal: d1a ? `1D紅吞不破前低且高點過MA(${maVal})` : `1D前${bullRun}根紅吞`,
-    h3Signal: `未破前面紅吞低點(${anchor3h.low})`,
+    h3Signal: `未破前根低(${prev3h.low})與前面紅吞低(${anchor3h.low})`,
     h1Signal: `${h1Signal}且站上MA(${maVal1h})`,
     fibBar: { high: fib1h.high, low: fib1h.low, time: fib1h.time },
-    entryPrice: fib1h.high,     // 斐波那契 1
-    stopPrice: fib1h.low,       // 斐波那契 0
+    entryPrice: chased ? curr1h.close : fib1h.high,   // 斐波那契 1，過了就用現價
+    stopPrice: fib1h.low,                             // 斐波那契 0
+    entryNote: chased ? `現價${curr1h.close}已過斐波那契1(${fib1h.high})，改用現價進場` : null,
   } };
 }
 
@@ -1041,6 +1058,8 @@ async function runScan() {
         `［策略${s.strategy}］${s.d3Signal} + ${s.d1Signal} + 3H${s.h3Signal} + ${s.h1Signal}`,
         `斐波那契錨點：黑K 高${s.fibBar.high} 低${s.fibBar.low}`,
       ];
+      // 進場價偏離斐波那契 1 時要講清楚，不然通知上的價格會跟錨點對不起來
+      if (s.entryNote) lines.push(`⚡ ${s.entryNote}`);
       if (s.trade?.ok) {
         const p3 = s.trade.plan;
         lines.push(
