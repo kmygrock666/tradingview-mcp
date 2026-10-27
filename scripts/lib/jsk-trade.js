@@ -342,9 +342,13 @@ export async function trailStops() {
   // 不排掉的話，早就被取消的單還會被當成「手上這個部位」拿來配對 ——
   // SKYAI 的 10/23 限價單在 17:34 就因逾時被取消，之後帳上那個來路不明的
   // 部位卻一直被配到它身上，用 v1 的 R 與目標價去搬停損。
+  //
+  // 只能排掉 'expired'（確定被我們取消，不會留下部位）。
+  // 'closed-or-filled' 不能排：它的意思只是「限價單離開掛單列」，成交也算 ——
+  // 真正成交的交易反而最需要移動停損。HAEDALUSDT 2026-10-26 就是這樣被漏掉：
+  // 單成交了、第一段停利也出場了，停損卻一直停在原始價位沒搬上來。
   const resolved = new Set(
-    journal.filter(e => e.ref && (e.status === 'expired' || e.status === 'closed-or-filled'))
-      .map(e => e.ref)
+    journal.filter(e => e.ref && e.status === 'expired').map(e => e.ref)
   );
   const trades = journal.filter(e =>
     e.entry && !e.dryRun && e.status === 'placed' && !resolved.has(e.ts));
