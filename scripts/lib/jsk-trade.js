@@ -154,21 +154,28 @@ function finishPlan({ entry, stop, targetPrices, equity, available }) {
     .filter(t => t.price > entry);
   if (!targets.length) return { ok: false, reason: `所有停利價都不在進場價 ${entry} 之上` };
 
-  const qtyEach = roundQty(qtyTotal / targets.length);
-  // 每批取到小數 2 位（步長限制）後可能歸零 —— 高價商品配小風險就會這樣。
-  // 這是真的下不了單，要講清楚而不是送出去被靜默拒掉。
+  // 每批數量：先用保守的 2 位；高價商品（BTC 這種 R 動輒幾百）在這個精度下
+  // 會直接歸零，那時退到 3 位 —— 0.001 是高價幣常見的步長，仍然合法。
+  // 寧可從粗到細逐步放寬，也不要一開始就給太多位數被後端靜默拒單。
+  const rawEach = qtyTotal / targets.length;
+  let qtyEach = roundQty(rawEach);
+  if (qtyEach <= 0) qtyEach = Math.round(rawEach * 1000) / 1000;
   if (qtyEach <= 0) {
     return { ok: false,
-             reason: `每批數量取到小數 2 位後是 0（風險 ${riskUSD} USD / R ${R}，總量 ${(riskUSD / R).toFixed(6)}）` };
+             reason: `每批數量取到小數 3 位仍是 0（風險 ${riskUSD} USD / R ${R}，總量 ${rawEach.toFixed(8)}）` };
   }
+  // 總量必須剛好等於每批 × 批數，不能再獨立四捨五入 —— 否則進場單的數量會跟
+  // 四層出場加起來對不上（BTC 實測：每批 0.004、四層 0.016，總量卻被 roundQty
+  // 進位成 0.02），保護倉位大小驗證過不了。toFixed 只是清掉浮點誤差。
+  const exactTotal = +(qtyEach * targets.length).toFixed(6);
 
   return {
     ok: true, entry, stop, R, targets,
-    qtyEach, qtyTotal: roundQty(qtyEach * targets.length),
+    qtyEach, qtyTotal: exactTotal,
     riskUSD, equity, capped,
     riskPct: risk.pct, drawdown: risk.drawdown, riskReduced: risk.reduced,
     // 實際風險：數量被保證金上限砍過的話會小於名目風險
-    actualRiskUSD: +(roundQty(qtyEach * targets.length) * R).toFixed(2),
+    actualRiskUSD: +(exactTotal * R).toFixed(2),
   };
 }
 
