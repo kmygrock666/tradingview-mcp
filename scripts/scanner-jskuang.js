@@ -76,9 +76,11 @@ const SCAN_TF = '18D';
  * 上一根 18D 是黑K，且現價過了它的實體上緣（開盤價）。
  * 回傳 { pass, failedAt?, detail? }，detail 讓通知可以直接被覆核。
  */
-// 紅吞：當前漲過前一根的高點且自身收紅（與監控器同一套定義，不限前一根顏色）
+// 紅吞：當前漲過前一根的「高點」，且收盤過前一根的「實體高點」。
+// 與監控器 isBullEngulf 同一套定義（2026-10-29 版）—— 這裡是另寫一份，
+// 定義若再變動兩邊都要改。
 function isBullEngulf(c, p) {
-  return c.high > p.high && c.close > c.open;
+  return c.high > p.high && c.close > Math.max(p.open, p.close);
 }
 const bodyLowOf = (b) => Math.min(b.open, b.close);
 const bodyHighOf = (b) => Math.max(b.open, b.close);
