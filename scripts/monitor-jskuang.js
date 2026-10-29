@@ -1135,7 +1135,7 @@ async function runScan() {
   if (rejSorted.length) {
     summary.push('卡關：' + esc(rejSorted.slice(0, 5).map(([k, n]) => `${k} ×${n}`).join('\n')));
   }
-  if (!REMOVAL_ENABLED) summary.push('（3D 移除檢查暫停中）');
+  if (!REMOVAL_ENABLED) summary.push('（18D 黑吞移除檢查暫停中）');
   if (!TRADING_ENABLED) summary.push('（自動下單已關閉）');
   if (trailNote) summary.push(esc(trailNote));
   if (expiredNote) summary.push(esc(expiredNote));
