@@ -173,14 +173,19 @@ const LOOKBACK_1D = 5;
 
 // 在最近 lookback 根裡找「連續收黑K 之後出一根紅K」的型態。
 // 轉紅那根不必是當前這根 —— 只要型態出現在視窗內就算數。
-// 黑K 串可以延伸到視窗之外：視窗限制的是「多久以前轉紅的」，不是黑K 有多長。
+//
+// 「整個型態」都要落在視窗內，黑K 串不能延伸到視窗之外。
+// （2026-11-01 修正：原本只限制轉紅那根在視窗內，黑K 串可以往前無限延伸，
+//  還把它寫成刻意設計。FETUSDT 因此誤判成立 —— 轉紅在 4 根前、連續 4 根黑
+//  全部落在 5~8 根前，最近 5 根其實是「紅 黑 紅 黑 黑」，一根連續黑都沒有。
+//  使用者的敘述是「前 5 根 K 內曾連續收黑K 後出一根紅K」，整串都算在內。）
 // 回傳最近的一組 { redIdx, blackRun, agoBars }，找不到回 null。
 function findBlackToRed(bars, lookback) {
   const start = Math.max(1, bars.length - lookback);
   for (let i = bars.length - 1; i >= start; i--) {
     if (!(bars[i].close > bars[i].open)) continue;      // 要是紅K
     let blackRun = 0;
-    for (let j = i - 1; j >= 0; j--) {
+    for (let j = i - 1; j >= start; j--) {             // 只數視窗內的黑K
       if (bars[j].close < bars[j].open) blackRun++; else break;
     }
     if (blackRun >= MIN_RUN) return { redIdx: i, blackRun, agoBars: bars.length - 1 - i };
@@ -202,6 +207,8 @@ function findBlackToRed(bars, lookback) {
 // 的寫法，中途破了又回來就會被永久排除。
 //
 // 錨點可以是當前這根 —— 當前價格一定落在自己的範圍內。
+// 「整個型態」都要落在視窗內，連續紅K 串不能延伸到視窗之外
+// （與條件1 同一條規則，2026-11-01 一併修正）。
 // 回傳最近成立的一組；不成立時 why 取「最近一根候選」卡在哪，卡關統計才有意義。
 //
 // 注意：maVal 是「現在」的 MA 值，拿去比對可能是好幾天前的紅K 高點。
@@ -219,7 +226,7 @@ function findRedRunThenHold(bars, maVal, lookback) {
     if (isBullEngulf(anchor, bars[k - 1])) continue;   // 還在紅吞＝漲勢沒停
 
     const redRun = [];
-    for (let j = k - 1; j >= 0; j--) {
+    for (let j = k - 1; j >= start; j--) {             // 只數視窗內的紅K
       if (bars[j].close > bars[j].open) redRun.unshift(bars[j]); else break;
     }
     if (redRun.length < MIN_RUN) { note(`連續紅K只有 ${redRun.length} 根`, `連續紅K不足 ${MIN_RUN} 根`); continue; }
