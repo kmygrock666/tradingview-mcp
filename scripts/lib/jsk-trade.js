@@ -357,8 +357,10 @@ export async function trailStops() {
   const resolved = new Set(
     journal.filter(e => e.ref && e.status === 'expired').map(e => e.ref)
   );
-  const trades = journal.filter(e =>
-    e.entry && !e.dryRun && e.status === 'placed' && !resolved.has(e.ts));
+  // 被標成 expired 的也留在候選裡，只是排序時墊後 —— 那個標記不一定可靠：
+  // BEATUSDT 的 10-29 單被記成 expired，但帳上的部位數量（4 批整除）明明
+  // 就是它成交的。真正的把關交給下面的「數量必須整除」條件。
+  const allTrades = journal.filter(e => e.entry && !e.dryRun && e.status === 'placed');
   const positions = await listPositions();
   const moved = [], failed = [];
 
@@ -367,14 +369,29 @@ export async function trailStops() {
     // 同一個標的會交易很多次（八天內 206 筆裡不乏重複的幣），不能只取「最後
     // 一筆」—— 那常常是還沒成交的新單，目標價跟手上這個部位對不起來，階梯
     // 就永遠不會觸發。改用持倉均價去配對：進場價最接近的那筆才是這個部位。
-    const cands = trades.filter(t => t.symbol === pos.symbol);
-    let trade = null, bestDiff = Infinity;
-    for (const c of cands) {
+    // 配對不能只看進場價：同一個幣短期內常有兩三筆，價格相近但每批數量差很多。
+    // 數量才是決定性的證據 —— 部位數量一定是「每批 × 剩餘批數」，所以
+    // qty / qtyEach 必須接近整數，且不超過當初的批數。
+    //
+    // BEATUSDT 2026-11-05 就是只看價格配錯的：帳上 2494.68 @ 0.09139，
+    // 10-29 那筆（qtyEach 623.67，4 批剛好整除、價差 0.055%）才是對的，
+    // 卻因為被標成 expired 而排除，結果配到 10-27 那筆（qtyEach 1478，
+    // 算出 1.69 批、價差 0.875%）。批數錯 → 階梯誤判成 20.8R →
+    // 算出的新停損 0.11447 高於現價 0.10387，一旦套用就是立刻市價平倉。
+    const scored = [];
+    for (const c of allTrades.filter(t => t.symbol === pos.symbol)) {
       const diff = Math.abs(c.entry - pos.avg) / (pos.avg || 1);
-      if (diff < bestDiff) { bestDiff = diff; trade = c; }
+      if (diff > 0.05) continue;                       // 價格差太多不可能是同一筆
+      const legsRaw = pos.qty / c.qtyEach;
+      const legs = Math.round(legsRaw);
+      if (legs < 1 || legs > (c.targets || []).length) continue;
+      if (Math.abs(legsRaw - legs) > 0.02) continue;   // 不是整數批＝不是這一筆
+      scored.push({ c, diff, legs, resolved: resolved.has(c.ts) });
     }
-    // 差超過 5% 就不是同一筆，寧可不動也不要用錯的目標價去搬停損
-    if (!trade || bestDiff > 0.05) continue;
+    // 沒被結清的優先；同級再比價差
+    scored.sort((a, b) => (a.resolved - b.resolved) || (a.diff - b.diff));
+    const trade = scored.length ? scored[0].c : null;
+    if (!trade) continue;
 
     // 把剩餘數量也交給階梯判斷：某一批已出場＝那個目標價一定到過
     const ladder = stopLadderFor(trade, pos.last, pos.qty);
@@ -382,6 +399,23 @@ export async function trailStops() {
     const cur = currentStopOf(trade, journal);
     // 浮點數比較留一點容差，免得每輪都重做同一次移動
     if (!(ladder.newStop > cur * (1 + 1e-9))) continue;
+
+    // 最後一道防線：做多的停損絕不能等於或高於現價 —— 那是賣出停損掛在市價
+    // 之上，一掛就觸發，等於把部位當場市價平掉。
+    // 配對錯誤、階梯誤判、價格讀錯都可能算出這種值（SKYAI 2026-10-25 讀錯
+    // 價格、BEATUSDT 2026-11-05 配錯交易，兩次都算出市價之上的停損），
+    // 與其追每一個上游成因，不如在出手前統一擋下來並吵出來。
+    if (!(pos.last > 0) || ladder.newStop >= pos.last) {
+      const rec = {
+        ts: new Date().toISOString(), ref: trade.ts, symbol: pos.symbol,
+        status: 'stop-move-refused', verified: false, liveStop: null,
+        price: pos.last, stage: ladder.stage, oldStop: cur, newStop: ladder.newStop,
+        detail: `停損 ${ladder.newStop} 不低於現價 ${pos.last}，拒絕套用（會立刻市價平倉）`,
+      };
+      appendJournal(rec);
+      failed.push(rec);
+      continue;
+    }
 
     // 只重建「還沒出場」的那幾層：已經在 5R 停利的那半已經走了，
     // 照原本兩層去建會把剩下的部位再切一半、還掛上一個早就該消失的停利，
