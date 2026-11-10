@@ -358,6 +358,30 @@ export async function ensureTradingPanel() {
       steps.push('選 Paper Trading');
       await sleep(3000);
     }
+    if (hasAccountTabs()) return { ok: true, action: steps.join('→') };
+
+    // 4) 選完之後還會再跳一個「Paper Trading / 連接」的說明對話框 ——
+    //    模擬帳戶斷線時就是卡在這裡（2026-11-10 BNBUSDT 下單失敗的原因）。
+    //    只在這個對話框內找「連接」，別誤點券商清單上其他家的連接鈕。
+    var dlg = Array.prototype.slice.call(document.querySelectorAll('div')).filter(function(d){
+      var t = d.innerText || '';
+      return d.offsetParent !== null && /Paper Trading/i.test(t) && /連接|Connect/i.test(t) && t.length < 600;
+    }).sort(function(a, b){ return (a.innerText||'').length - (b.innerText||'').length; })[0];
+    if (dlg) {
+      var ok = Array.prototype.slice.call(dlg.querySelectorAll('button,[role="button"]')).filter(function(b){
+        var t = (b.textContent || '').trim();
+        return b.offsetParent !== null && (t === '連接' || /^Connect$/i.test(t));
+      })[0];
+      if (ok) {
+        var rc = ok.getBoundingClientRect();
+        ['mousedown','mouseup','click'].forEach(function(k){
+          ok.dispatchEvent(new MouseEvent(k, { bubbles:true, cancelable:true, view:window,
+            clientX: rc.left + rc.width/2, clientY: rc.top + rc.height/2 }));
+        });
+        steps.push('按連接');
+        for (var w = 0; w < 20 && !hasAccountTabs(); w++) await sleep(500);
+      }
+    }
     return { ok: hasAccountTabs(), action: steps.join('→') || '沒有可用的開啟方式' };
   })()`);
 }
