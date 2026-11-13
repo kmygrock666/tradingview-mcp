@@ -61,10 +61,10 @@
  * 用法：node scripts/monitor-jskuang.js [間隔分鐘數，預設 30]
  */
 
-import { connect, disconnect, evaluate, evaluateAsync, getTargetInfo } from '../src/connection.js';
+import { connect, disconnect, evaluate, evaluateAsync, getTargetInfo, CDP_HOST, CDP_PORT } from '../src/connection.js';
 import { getOhlcv, getStudyValues } from '../src/core/data.js';
 import { removeFromList } from '../src/core/watchlist.js';
-import { tradeSignal, expireStaleOrders, trailStops, baseAsset, ORDER_TTL_MS, DRAWDOWN_TRIGGER, RISK_PCT_REDUCED } from './lib/jsk-trade.js';
+import { tradeSignal, expireStaleOrders, trailStops, reconcileCloses, baseAsset, ORDER_TTL_MS, DRAWDOWN_TRIGGER, RISK_PCT_REDUCED } from './lib/jsk-trade.js';
 import { drawEntryFib, clearOurFib } from './lib/fib-draw.js';
 import { openExposure } from './lib/paper-order.js';
 
@@ -338,20 +338,28 @@ async function chartHealth() {
     url = info?.url || '';
     title = info?.title || '';
   } catch { /* 取不到分頁資訊就只靠下面的 API 探測 */ }
+  // 圖表 crash 時 connect() 會刻意跳過 error-view，改接外框視窗；只看「連到哪頁」
+  // 會誤判成接錯分頁，所以要掃整份分頁清單才看得到 crash 的那一頁。
+  let crashed = false;
+  try {
+    const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+    const targets = await resp.json();
+    crashed = targets.some(t => /error-view|crashReason/i.test(t.url || ''));
+  } catch { /* 9222 連不上就交給下面的 url 判斷 */ }
   let ok = false;
   try {
     ok = await evaluate(
       'typeof window.TradingViewApi !== "undefined" && !!window.TradingViewApi._activeChartWidgetWV'
     ) === true;
   } catch { ok = false; }
-  return { ok, url, title };
+  return { ok, url, title, crashed };
 }
 
 // 把「連到的是什麼」翻成人看得懂的一句話，別讓使用者對著 Failed to fetch 猜
-function diagnose({ url, title }) {
+function diagnose({ url, title, crashed }) {
   // Electron 內部頁的 title/url 會塞一長串 URL-encoded 參數，截掉才看得懂
   const where = String(title || url).replace(/\?.*$/, '').slice(0, 60);
-  if (/error-view|crashReason/i.test(url)) {
+  if (crashed || /error-view|crashReason/i.test(url)) {
     return 'TradingView 圖表已 crash（分頁變成錯誤畫面），需要重啟 TradingView';
   }
   if (/^file:/i.test(url)) {
@@ -1131,6 +1139,25 @@ async function runScan() {
     } catch (e) {
       expiredNote = `逾期掛單檢查失敗：${e.message}`;
       console.error('  ⚠️ ', expiredNote);
+    }
+  }
+
+  // 把新的平倉結果寫回帳本。帳本原本只記下單不記結果，要算勝率就得臨時爬 UI，
+  // 而那個清單是虛擬捲動的、只拿得到最近幾天。每輪寫一次，歷史就留在本地。
+  let closedNote = null;
+  if (TRADING_ENABLED) {
+    try {
+      const rec = await reconcileCloses();
+      if (rec.ok && rec.added) {
+        closedNote = `對帳寫入 ${rec.added} 筆平倉結果`;
+        console.log(`  📒 ${closedNote}${rec.unmatched ? `（其中 ${rec.unmatched} 筆配不到帳本交易）` : ''}`);
+      } else if (!rec.ok) {
+        closedNote = `平倉對帳失敗：${rec.reason}`;
+        console.error('  ⚠️ ', closedNote);
+      }
+    } catch (e) {
+      closedNote = `平倉對帳失敗：${e.message}`;
+      console.error('  ⚠️ ', closedNote);
     }
   }
 

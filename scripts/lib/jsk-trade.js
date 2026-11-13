@@ -13,6 +13,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { evaluateAsync } from '../../src/connection.js';
 import { accountSummary, placeLimitBracket, listOrders, cancelOrders, closeTicket, openExposure, ensureTradingPanel, listPositions, rebuildPositionExits, setPositionSimpleExits, chartLastPrice } from './paper-order.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -260,6 +261,88 @@ export async function placeSignalOrders({ symbol, plan, barTime, variant = null,
   };
   appendJournal(entry);
   return entry;
+}
+
+/**
+ * 把 TradingView「餘額歷史」裡的平倉結果寫回帳本。
+ *
+ * 為什麼需要：帳本原本只記「下了什麼單」，不記結果，所以要算勝率或盈虧只能
+ * 臨時去爬 UI —— 而那個清單是虛擬捲動的，捲到底也只拿得到最近幾天
+ * （2026-11-11 要做績效分析時只撈得到 4 天、12 筆）。每輪把新的平倉寫進帳本
+ * 之後，歷史就留在本地，分析不再受 UI 限制。
+ *
+ * 冪等靠 closeKey（商品＋出場價＋數量＋持倉均價）：同一次平倉只會寫一次。
+ * 配對沿用與移動停損相同的規則（同商品、進場價相近），配不到就記 ref: null，
+ * 寧可留著一筆無主紀錄，也不要硬塞給錯的交易。
+ */
+export async function reconcileCloses() {
+  const raw = await evaluateAsync(`(async function(){
+    function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+    var tab = Array.prototype.slice.call(document.querySelectorAll('button')).filter(function(b){
+      return b.offsetParent !== null && (b.textContent||'').trim().indexOf('餘額歷史') === 0;
+    })[0];
+    if (!tab) return { ok: false, reason: '找不到餘額歷史分頁' };
+    tab.click();
+    await sleep(1500);
+    function grab(){
+      return Array.prototype.slice.call(document.querySelectorAll('tr')).filter(function(e){
+        var t = e.innerText || '';
+        return e.offsetParent !== null && t.indexOf('position for symbol') >= 0 && t.length < 600;
+      }).map(function(e){ return (e.innerText || '').split(String.fromCharCode(10)).join(' '); });
+    }
+    // 清單是虛擬捲動的，要捲到底才載得出舊紀錄
+    var seen = grab();
+    var cands = Array.prototype.slice.call(document.querySelectorAll('div')).filter(function(d){
+      return d.scrollHeight > d.clientHeight + 40 && d.clientHeight > 100 && d.querySelector('tr');
+    }).sort(function(a, b){ return b.scrollHeight - a.scrollHeight; });
+    if (cands[0]) {
+      for (var i = 0; i < 40; i++) {
+        cands[0].scrollTop = cands[0].scrollHeight;
+        await sleep(350);
+        var now = grab();
+        if (now.length <= seen.length) break;
+        seen = now;
+      }
+    }
+    return { ok: true, lines: seen };
+  })()`);
+  if (!raw.ok) return { ok: false, reason: raw.reason, added: 0 };
+
+  const journal = readJournal();
+  const known = new Set(journal.filter(e => e.closeKey).map(e => e.closeKey));
+  const trades = journal.filter(e => e.entry && !e.dryRun && e.status === 'placed');
+
+  let added = 0, unmatched = 0;
+  for (const line of raw.lines) {
+    const m = line.match(
+      /Close (long|short) position for symbol (\S+) at price ([\d.]+) for ([\d.]+) units\.\s*Position AVG Price was ([\d.]+)/);
+    if (!m) continue;
+    const [, side, symbol, exitS, qtyS, avgS] = m;
+    const exit = +exitS, qty = +qtyS, avg = +avgS;
+    const closeKey = `${symbol}|${exit}|${qty}|${avg}`;
+    if (known.has(closeKey)) continue;
+    known.add(closeKey);
+
+    const pnl = +(((exit - avg) * qty) * (side === 'long' ? 1 : -1)).toFixed(4);
+    // 同商品、進場價最接近持倉均價的那一筆；差太多就不配
+    let trade = null, best = Infinity;
+    for (const t of trades.filter(t => t.symbol === symbol)) {
+      const d = Math.abs(t.entry - avg) / (avg || 1);
+      if (d < best) { best = d; trade = t; }
+    }
+    if (best > 0.05) { trade = null; unmatched++; }
+
+    appendJournal({
+      ts: new Date().toISOString(), status: 'closed', closeKey,
+      ref: trade ? trade.ts : null, symbol, side, exit, qty, avg, pnl,
+      variant: trade ? (trade.variant || null) : null,
+      rMultiple: trade && trade.R > 0 ? +(((exit - avg) / trade.R)).toFixed(2) : null,
+      // 來源是 UI 的敘述文字，留著方便日後覆核
+      note: trade ? null : '配不到帳本交易',
+    });
+    added++;
+  }
+  return { ok: true, added, unmatched, scanned: raw.lines.length };
 }
 
 /**
